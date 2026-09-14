@@ -66,8 +66,16 @@ Cliente HTTP
 ### Opción A: Con Docker + MiniStack (Recomendado)
 
 ```bash
-# Levanta todo el stack: MiniStack + App + DynamoDB Admin + StackPort
+# 1. Levanta la infraestructura: MiniStack + App + DynamoDB Admin + StackPort
 docker-compose up -d
+
+# 2. Espera a que MiniStack esté healthy (aprox. 10-15s)
+# Ver: curl http://localhost:4566/health
+
+# 3. Provisiona recursos + Lambdas directamente en MiniStack (bootstrap)
+npm run bootstrap:ministack
+#   Esto crea: tabla DynamoDB, cola SQS, tópico SNS, state machine, 8 Lambdas,
+#   event source mapping SQS→processOrder, y ejecuta un smoke test E2E.
 
 # Ver logs de la app
 docker-compose logs -f app
@@ -169,6 +177,25 @@ Con MiniStack, el cliente DynamoDB usa `http://ministack:4566` automáticamente 
 
 StackPort se conecta automáticamente a MiniStack vía `AWS_ENDPOINT_URL=http://ministack:4566` (configurado en docker-compose). No requiere configuración adicional.
 
+## Scripts disponibles
+
+| Script | Qué hace |
+|--------|----------|
+| `npm run bootstrap:ministack` | **Provisiona todo en MiniStack**: tabla DynamoDB, cola SQS, tópico SNS, state machine, 8 Lambdas, event source mapping SQS→processOrder. Ejecuta smoke test E2E opcional (`SMOKE_TEST=0` para saltarlo). |
+| `npm run deploy:local` | `serverless deploy` contra MiniStack usando shim SDK v2 (`scripts/sls-v2-endpoint.js`). **Limitado**: MiniStack CF no soporta `TemplateURL` ni `Lambda::Version` → no materializa Lambdas reales. |
+| `npm run offline` | `serverless offline start` — emula solo API Gateway + Lambda en puerto 3000. **NO emula** SQS, Step Functions, SNS. |
+
+### ¿Por qué `bootstrap:ministack` en vez de `serverless deploy`?
+
+MiniStack implementa CloudFormation, pero con **limitaciones conocidas**:
+1. **No resuelve `TemplateURL`** — Serverless sube el template a S3 y pasa la URL; MiniStack exige `TemplateBody` (archivo local).
+2. **No crea `AWS::Lambda::Function` + `AWS::Lambda::Version`** — dependencias circulares no soportadas.
+3. **No valida IAM roles** — roles dummy son aceptados pero no funcionales.
+
+La solución: **provisionar data-plane directo vía AWS CLI** contra el endpoint MiniStack (:4566). El script `scripts/ministack-bootstrap.sh` es **idempotente** (re-actualiza código/env si el recurso existe) y usa los **mismos nombres** que `serverless.yml` para consistencia.
+
+Ver detalles técnicos en: `learning-records/0005-ministack-deploy-and-lambda-env.md`
+
 ## Tests
 
 ```bash
@@ -178,29 +205,28 @@ npm test
 Corre Jest con mocks del AWS SDK (`aws-sdk-client-mock`), sin necesidad de
 credenciales ni recursos reales desplegados. Genera reporte de cobertura.
 
-## Deploy a AWS
+## Probar el flujo completo (después de `bootstrap:ministack`)
 
 ```bash
-npm run deploy          # stage dev
-npm run deploy:prod     # stage prod
-```
-
-Esto crea todos los recursos (tabla DynamoDB, cola SQS, tópico SNS, state
-machine, funciones Lambda y el endpoint de API Gateway) vía CloudFormation,
-gestionado por Serverless Framework.
-
-## Probar el flujo completo ya desplegado
-
-```bash
-curl -X POST https://<tu-endpoint>/orders \
+# 1. Crear una orden (HTTP 201, escribe en DynamoDB, encola en SQS)
+curl -X POST http://localhost:3000/orders \
   -H "Content-Type: application/json" \
   -d '{"customerId": "cust-123", "items": [{"sku": "ABC", "qty": 2}]}'
+
+# 2. El event source mapping SQS→processOrder dispara la Lambda automáticamente
+#    que invoca Step Functions StartExecution
+
+# 3. Ver el estado final en DynamoDB (usar orderId de la respuesta)
+aws --endpoint-url http://localhost:4566 dynamodb get-item \
+  --table-name serverless-order-pipeline-orders-dev \
+  --key '{"orderId":{"S":"<orderId-del-paso-1>"}}'
+
+# 4. O ver la ejecución completa en Step Functions
+aws --endpoint-url http://localhost:4566 stepfunctions list-executions \
+  --state-machine-arn arn:aws:states:us-east-1:123456789012:stateMachine:OrderFulfillmentStateMachine
+
+# Para forzar el camino de cancelación, mandar un qty mayor a 100 en algún item.
 ```
-
-Revisar el estado de la orden en la tabla DynamoDB (`orderId` devuelto en la
-respuesta), o ver la ejecución completa en la consola de Step Functions.
-
-Para forzar el camino de cancelación, mandar un `qty` mayor a 100 en algún item.
 
 ## Mapeo contra los requisitos de la entrevista
 
