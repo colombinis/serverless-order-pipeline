@@ -52,17 +52,70 @@ Cliente HTTP
 
 ## Requisitos previos
 
+### Opción A: Desarrollo local con Docker + MiniStack (Recomendado)
+- Docker Desktop / Docker Engine + Docker Compose
+- **No requiere cuenta AWS real** - MiniStack emula 60+ servicios localmente
+
+### Opción B: Desarrollo local tradicional
 - Node.js 18+
 - Cuenta de AWS con credenciales configuradas (`aws configure`)
 - `npm install -g serverless` (o usar `npx serverless`)
 
 ## Instalación
 
+### Opción A: Con Docker + MiniStack (Recomendado)
+
+```bash
+# Levanta todo el stack: MiniStack + App + DynamoDB Admin + StackPort
+docker-compose up -d
+
+# Ver logs de la app
+docker-compose logs -f app
+
+# Ver logs de MiniStack
+docker-compose logs -f ministack
+
+# Para bajar todo
+docker-compose down
+```
+
+El endpoint de la API estará disponible en: `http://localhost:3000`
+
+El panel de DynamoDB Admin en: `http://localhost:8001`
+
+**StackPort (AWS Resource Browser)** en: `http://localhost:8081`
+
+MiniStack health check: `curl http://localhost:4566/health`
+
+StackPort health check: `curl http://localhost:8081/api/health`
+
+### Opción B: Instalación tradicional
+
 ```bash
 npm install
 ```
 
 ## Desarrollo local
+
+### Opción A: Con Docker + MiniStack (Recomendado - Full AWS emulation)
+
+```bash
+# Levanta DynamoDB local + serverless-offline (API Gateway + Lambda emulados)
+# MiniStack emula TODOS los servicios: SQS, Step Functions, SNS, DynamoDB, etc.
+docker-compose up -d
+
+# Ver logs en tiempo real
+docker-compose logs -f app
+```
+
+**Ventajas clave:**
+- ✅ **SQS, Step Functions, SNS funcionan nativamente** - `serverless-offline` solo emula HTTP + Lambda
+- ✅ **RDS Postgres real** - MiniStack levanta contenedor Postgres real en puerto 15432
+- ✅ **ElastiCache Redis real** - Contenedor Redis real en puerto 16379
+- ✅ **Multi-account / multi-region** - Aislamiento completo por Access Key ID
+- ✅ **Compatible con Terraform, CDK, Pulumi, AWS CLI, SDKs** - Drop-in replacement
+
+### Opción B: Solo serverless-offline (Limitado)
 
 ```bash
 # Instala el plugin de DynamoDB local la primera vez
@@ -72,11 +125,49 @@ sls dynamodb install
 npm run offline
 ```
 
-Nota: `serverless-offline` emula bien HTTP + Lambda, pero **no emula SQS, Step
-Functions ni SNS**. Para probar el flujo completo end-to-end sin desplegar,
-la alternativa es levantar [LocalStack](https://www.localstack.cloud/) y
-apuntar los clientes de AWS SDK a su endpoint (mismo patrón que ya usamos
-para DynamoDB en `src/lib/dynamo.js` con `IS_OFFLINE`).
+**Limitaciones conocidas:**
+- ❌ `serverless-offline` **NO emula SQS, Step Functions ni SNS**
+- ❌ Para flujo end-to-end completo sin AWS real, necesitas MiniStack o LocalStack
+- ✅ Sirve para pruebas unitarias de handlers HTTP + Lambda aislados
+
+### Variables de entorno para desarrollo con MiniStack
+
+El `docker-compose.yml` configura automáticamente:
+
+```bash
+IS_OFFLINE=true
+AWS_ENDPOINT_URL=http://ministack:4566
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=123456789012
+AWS_SECRET_ACCESS_KEY=test
+```
+
+En el código, `src/lib/dynamo.js` ya detecta `IS_OFFLINE` y apunta a `localhost:8000`. 
+Con MiniStack, el cliente DynamoDB usa `http://ministack:4566` automáticamente via `AWS_ENDPOINT_URL`.
+
+## StackPort — Visualizador de recursos AWS
+
+**StackPort** es un panel web open-source para navegar e inspeccionar recursos en emuladores AWS (MiniStack, LocalStack, Moto) y cuentas AWS reales. En este proyecto se levanta como servicio en `docker-compose.yml`.
+
+### Qué puedes hacer con StackPort en este proyecto
+
+| Servicio | Qué ver/inspeccionar |
+|----------|---------------------|
+| **DynamoDB** | Tabla `serverless-order-pipeline-orders-dev`, items, atributos, capacidad |
+| **SQS** | Cola `serverless-order-pipeline-order-queue-dev`, mensajes en cola, atributos |
+| **SNS** | Tópico `serverless-order-pipeline-notifications-dev`, suscripciones |
+| **Step Functions** | State machine `OrderFulfillmentStateMachine`, definiciones, ejecuciones |
+| **Lambda** | Las 8 funciones del proyecto, configuración, variables de entorno |
+| **CloudWatch Logs** | Logs de cada Lambda invocada |
+| **IAM** | Roles y políticas creadas por Serverless Framework |
+
+### Acceso
+
+- URL: `http://localhost:8081`
+- Health check: `curl http://localhost:8081/api/health`
+- API endpoints: `curl http://localhost:8081/api/endpoints`
+
+StackPort se conecta automáticamente a MiniStack vía `AWS_ENDPOINT_URL=http://ministack:4566` (configurado en docker-compose). No requiere configuración adicional.
 
 ## Tests
 
