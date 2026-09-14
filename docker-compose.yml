@@ -1,0 +1,90 @@
+services:
+  # StackPort - Universal AWS Resource Browser (MiniStack, LocalStack, Moto, real AWS)
+  # Web UI: http://localhost:8081
+  stackport:
+    image: davireis/stackport:latest
+    container_name: serverless-order-pipeline-stackport
+    ports:
+      - "8081:8080"
+    environment:
+      - AWS_ENDPOINT_URL=http://ministack:4566
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=123456789012
+      - AWS_SECRET_ACCESS_KEY=test
+    depends_on:
+      ministack:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # MiniStack - AWS Emulator (60+ services on single port 4566)
+  # Free forever, MIT licensed, drop-in LocalStack replacement
+  ministack:
+    image: ministackorg/ministack:full
+    container_name: serverless-order-pipeline-ministack
+    ports:
+      - "4566:4566"          # Main endpoint (all AWS services)
+      - "15432:15432"        # RDS Postgres (real container)
+      - "16379:16379"        # ElastiCache Redis (real container)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Required for real infrastructure (RDS, ECS, Lambda containers)
+      - ministack_data:/var/lib/ministack
+    environment:
+      - MINISTACK_ACCOUNT_ID=123456789012
+      - MINISTACK_REGION=us-east-1
+      - GATEWAY_PORT=4566
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4566/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Node.js App - Serverless Order Pipeline
+  # Connects to MiniStack via AWS_ENDPOINT_URL=http://ministack:4566
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: serverless-order-pipeline-app
+    ports:
+      - "3000:3000"          # serverless-offline HTTP API
+      - "4000:4000"          # serverless-offline Lambda debugging
+    environment:
+      - NODE_ENV=development
+      - IS_OFFLINE=true
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=123456789012
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_ENDPOINT_URL=http://ministack:4566
+      - ORDERS_TABLE=serverless-order-pipeline-orders-dev
+      - ORDER_QUEUE_URL=http://ministack:4566/123456789012/serverless-order-pipeline-order-queue-dev
+      - NOTIFICATIONS_TOPIC_ARN=arn:aws:sns:us-east-1:123456789012:***
+      - STATE_MACHINE_ARN=arn:aws:states:us-east-1:123456789012:stateMachine:OrderFulfillmentStateMachine
+    volumes:
+      - .:/app
+      - /app/node_modules
+    depends_on:
+      ministack:
+        condition: service_healthy
+    command: npm run offline
+    restart: unless-stopped
+
+  # Optional: DynamoDB Admin UI for visual inspection
+  dynamodb-admin:
+    image: aaronshaf/dynamodb-admin
+    container_name: serverless-order-pipeline-dynamodb-admin
+    ports:
+      - "8001:8001"
+    environment:
+      - DYNAMO_ENDPOINT=http://ministack:4566
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=123456789012
+      - AWS_SECRET_ACCESS_KEY=test
+    depends_on:
+      - ministack
+    restart: unless-stopped
+
+volumes:
+  ministack_data:
+    driver: local
