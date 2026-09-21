@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lección 2: serverless.yml y el despliegue contra MiniStack</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Lección 2: serverless.yml y el despliegue contra MiniStack</h1>
+<p style="color: var(--color-muted); font-size: 0.85rem; margin-bottom: 2rem;">
+  <a href="../MISSION.md">Misión</a> &middot; <a href="../RESOURCES.md">Recursos</a> &middot;
+  <a href="0001-architecture-overview.html">Lección 1</a>
+</p>
+
+<div class="callout callout-danger">
+  <p class="callout-label">Caso real (histórico)</p>
+  <p>Mientras preparábamos esta lección, el contenedor <code>app</code> de este proyecto (el que corría serverless-offline en el setup anterior) estaba en crash-loop (<code>Restarting</code>). Lo vamos a usar como caso de estudio: aprenderás a diagnosticar exactamente este tipo de error.</p>
+</div>
+
+<h2>¿Qué es serverless.yml?</h2>
+
+<p><code>serverless.yml</code> es el <strong>plano único que declara toda tu infraestructura</strong>. Un solo archivo YAML dice "tengo 8 Lambdas, una tabla DynamoDB, una cola SQS, un tópico SNS y una state machine". Ese es todo el flujo de este proyecto.</p>
+
+<p>La clave para la certificación: <strong>Serverless Framework no crea los recursos directamente</strong>. Convierte tu <code>serverless.yml</code> en un <em>template de CloudFormation</em>, y CloudFormation (real o emulado) es quien realmente crea cada recurso. El marco es solo un traductor que te evita escribir el template a mano.</p>
+
+<h2>Anatomía del archivo</h2>
+
+<table>
+  <thead>
+    <tr><th>Sección</th><th>Qué declara</th><th>Qué genera en CloudFormation</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>service</code></td><td>Nombre del servicio</td><td>Prefijo de nombres de recursos</td></tr>
+    <tr><td><code>frameworkVersion</code></td><td>Versión mayor del CLI</td><td>(nada — restricción de tooling)</td></tr>
+    <tr><td><code>plugins</code></td><td>Extensiones: step-functions, offline</td><td>(nada — lógica del CLI)</td></tr>
+    <tr><td><code>provider</code></td><td>Runtime, región, stage, <strong>variables de entorno</strong> e <strong>IAM role</strong></td><td><code>AWS::IAM::Role</code> + <code>Lambda::Function</code> config</td></tr>
+    <tr><td><code>functions</code></td><td>Las 8 funciones (handler + eventos)</td><td>8 <code>AWS::Lambda::Function</code> + triggers</td></tr>
+    <tr><td><code>stepFunctions</code></td><td>La state machine de fulfillment</td><td><code>AWS::StepFunctions::StateMachine</code></td></tr>
+    <tr><td><code>resources</code></td><td>Recursos raw de CloudFormation: tabla, cola, tópico</td><td><code>AWS::DynamoDB::Table</code>, <code>AWS::SQS::Queue</code>, <code>AWS::SNS::Topic</code></td></tr>
+    <tr><td><code>custom</code></td><td>Config de plugins (p. ej. serverless-offline)</td><td>(nada — config local)</td></tr>
+  </tbody>
+</table>
+
+<p>Mirá el `serverless.yml` real de este proyecto mientras seguís. Prestá atención a tres detalles, porque son los que más aparecen en exámenes:</p>
+
+<h3>1. Las variables de entorno conectan el código con la infra</h3>
+
+<pre><code>environment:
+  ORDERS_TABLE: ${self:service}-orders-${self:provider.stage}
+  ORDER_QUEUE_URL: ${env:ORDER_QUEUE_URL, 'https://sqs.${self:provider.region}.amazonaws.com/123456789012/${self:service}-order-queue-${self:provider.stage}'}
+  NOTIFICATIONS_TOPIC_ARN: !Ref OrderNotificationsTopic
+  STATE_MACHINE_ARN: !Ref OrderFulfillmentStateMachine</code></pre>
+
+<p>El código nunca hardcodea nombres de recursos. Lee <code>process.env.ORDERS_TABLE</code>, <code>process.env.ORDER_QUEUE_URL</code>, etc. El nombre real se inyecta en deploy. Esto es <strong>infraestructura como código bien hecha</strong>: si cambias el nombre de la tabla, el Lambda no se entera.</p>
+
+<p>Notá las dos sintaxis: <code>${self:...}</code> es la interpolación de Serverless, y <code>!Ref</code> / <code>!GetAtt</code> son <strong>funciones intrínsecas de CloudFormation</strong> que resuelven el ARN del recurso al desplegar.</p>
+
+<p><strong>Aprendizaje real (bug de esta sesión):</strong> <code>ORDER_QUEUE_URL: !Ref OrderQueue</code> funciona en AWS real, pero offline resuelve el Ref de la cola con una cuenta placeholder y MiniStack responde <code>QueueDoesNotExist</code>. La solución es el patrón <code>${env:VAR, fallback}</code>: en el contenedor (docker-compose) la variable apunta a <code>http://ministack:4566/123456789012/...</code>, y en un deploy real cae al fallback con la URL de SQS real.</p>
+
+<h3>2. El IAM role del provider es "least privilege"</h3>
+
+<pre><code>iam:
+  role:
+    statements:
+      - Effect: Allow
+        Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem]
+        Resource: !GetAtt OrdersTable.Arn</code></pre>
+
+<p>Cada Lambda recibe <em>solo</em> lo que necesita: <code>PutItem/GetItem/UpdateItem</code> en la tabla, <code>SendMessage</code> en la cola, <code>Publish</code> en el tópico, <code>StartExecution</code> en la state machine. Sin permisos <code>*</code>. Ese es el patrón <strong>least privilege</strong> que evalúan en la certificación.</p>
+
+<h3>3. Una función = un handler = una responsabilidad</h3>
+
+<pre><code>functions:
+  createOrder:
+    handler: src/handlers/createOrder.handler
+    events:
+      - httpApi:
+          path: /orders
+          method: post
+
+  validateStock:
+    handler: src/handlers/validateStock.handler</code></pre>
+
+<p>La sección <code>functions</code> mapea nombre → archivo de código. <code>handler: src/handlers/createOrder.handler</code> significa "exportá la función llamada <code>handler</code> del archivo <code>src/handlers/createOrder.js</code>". Ese es el contrato entre infraestructura y código: cuando CloudFormation despliega esa Lambda, sabe qué entry point ejecutar.</p>
+
+<h2>¿Cómo llega el código a MiniStack?</h2>
+
+<p>Hay <strong>dos modos</strong> de correr este proyecto, y confundirlos es la fuente de la mayoría de los errores:</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg">
+    <text x="380" y="24" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1a1a1a">Modo A: serverless deploy</text>
+    <rect x="20" y="40" width="170" height="44" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d"/>
+    <text x="105" y="58" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">serverless.yml</text>
+    <text x="105" y="74" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">+ código</text>
+    <line x1="190" y1="62" x2="240" y2="62" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#ar)"/>
+    <rect x="240" y="40" width="170" height="44" rx="6" fill="#1a1a1a" opacity="0.08" stroke="#1a1a1a"/>
+    <text x="325" y="58" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">CloudFormation API</text>
+    <text x="325" y="74" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">template generado</text>
+    <line x1="410" y1="62" x2="460" y2="62" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#ar)"/>
+    <rect x="460" y="40" width="270" height="44" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d"/>
+    <text x="595" y="58" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">MiniStack :4566</text>
+    <text x="595" y="74" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">CloudFormation + los 8 servicios</text>
+
+    <text x="380" y="138" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1a1a1a">Modo B: serverless offline</text>
+    <rect x="20" y="154" width="200" height="66" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d"/>
+    <text x="120" y="172" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">serverless-offline</text>
+    <text x="120" y="188" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">emula API Gateway + Lambda</text>
+    <text x="120" y="204" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">puerto 3000 (tu código, en proceso)</text>
+    <line x1="220" y1="170" x2="270" y2="170" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#ar)"/>
+    <line x1="300" y1="170" x2="350" y2="170" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#ar)"/>
+    <rect x="350" y="154" width="380" height="66" rx="6" fill="#1a1a1a" opacity="0.06" stroke="#1a1a1a"/>
+    <text x="540" y="172" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">MiniStack :4566 — servicios de backend</text>
+    <text x="540" y="188" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">DynamoDB · SQS · SNS · Step Functions</text>
+    <text x="540" y="204" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">vía AWS_ENDPOINT_URL=http://ministack:4566</text>
+
+    <text x="380" y="258" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#d94f3d" font-weight="700">El código SDK es IDÉNTICO en ambos modos — cambia solo a dónde apunta el endpoint.</text>
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+      </marker>
+    </defs>
+  </svg>
+  <p class="diagram-caption">Los dos modos de ejecución de este proyecto</p>
+</div>
+
+<h3>Modo A — deploy real (o a un emulador)</h3>
+<p><code>serverless deploy</code> empaqueta el código, genera el template CloudFormation y lo envía a la API de CloudFormation. Si el SDK apunta a MiniStack (<code>AWS_ENDPOINT_URL=http://localhost:4566</code>), CloudFormation emulado procesa el template y crea <em>todo</em> adentro de MiniStack: tabla, cola, tópico, state machine, Lambdas, el role IAM e incluso un API Gateway.</p>
+
+<div class="callout callout-warning">
+  <p class="callout-label">Corrección verificada (Lección 3)</p>
+  <p>En la práctica, el CF de MiniStack <strong>no puede</strong> procesar el template que genera serverless: rechaza <code>TemplateURL</code> (pide <code>TemplateBody</code> inline) y no resuelve el ciclo de dependencias de las <code>Lambda::Version</code>. Por eso este proyecto usa <code>scripts/ministack-bootstrap.sh</code> para provisionar los recursos por API directa. El "Modo A" sigue siendo el camino correcto para AWS real.</p>
+  <p><strong>Matiz importante:</strong> esto no significa que MiniStack no pueda emular API Gateway. La emulación de API Gateway (v1 REST de 86 operaciones y v2 HTTP de 42 operaciones) <strong>sí existe y funciona completa</strong> por control-plane — se crea con la AWS CLI contra <code>:4566</code> (<code>create-rest-api</code> → <code>create-resource</code> → <code>put-method</code> → <code>put-integration</code> → <code>create-deployment</code>) y se invoca por <code>/restapis/{apiId}/{stage}/_user_request_/</code>. Lo que falla es solo la materialización <em>del template de serverless</em> a través de CloudFormation. Ver <code>scripts/test.sh</code> para un ejemplo funcionando.</p>
+</div>
+
+<h3>Modo B — serverless-offline (el que usaba este proyecto)</h3>
+<p><em>Nota de contexto:</em> este modo fue el camino inicial de este proyecto, pero ya no se usa — hoy la entrada HTTP es la <strong>API Gateway nativa de MiniStack</strong> (v1 REST, creada por <code>scripts/ministack-bootstrap.sh</code> por control-plane, invocable en <code>/restapis/{apiId}/{stage}/_user_request_/</code>). Se mantiene aquí por valor pedagógico: muestra cómo se veía la matriz de servicios antes del bootstrap.</p>
+<p>El plugin <code>serverless-offline</code> emula <strong>en proceso</strong> el API Gateway y las Lambdas en el puerto 3000. Los servicios de backend (DynamoDB, SQS, SNS, Step Functions) <strong>no los emula</strong>: los busca en MiniStack a través de <code>AWS_ENDPOINT_URL</code>.</p>
+
+<blockquote>
+  <strong>Por esto el diagrama de la Lección 1 decía 9 servicios.</strong> El API Gateway y las Lambdas los ves corriendo en el contenedor <code>app</code>; el resto vive en MiniStack. Dos contenedores, una sola arquitectura.
+</blockquote>
+
+<h2>Cómo MiniStack "sabe" a qué servicio va cada petición</h2>
+
+<p>MiniStack corre los 60+ servicios en <strong>un solo puerto</strong> (4566). No hay un puerto por servicio. Enruta la petición así <a href="https://ministack.org/docs">(documentación oficial)</a>:</p>
+
+<ul>
+  <li>Por el <strong>scope del header de autorización</strong> (la firma SigV4 incluye el nombre del servicio)</li>
+  <li>Por el header <strong><code>X-Amz-Target</code></strong> (servicios JSON como DynamoDB, SNS, Step Functions)</li>
+  <li>Por el <strong>path de la URL</strong> (servicios REST como S3)</li>
+</ul>
+
+<p>Por eso tu código no cambia si el servicio está en AWS real o en MiniStack: el SDK firma los headers igual, y MiniStack los lee igual. El único cambio es <code>--endpoint-url</code> (CLI) o <code>AWS_ENDPOINT_URL</code> (SDK).</p>
+
+<h2>Dónde verificar los errores: las 3 capas</h2>
+
+<p>Cuando algo falla, hay exactamente <strong>tres lugares</strong> donde mirar, en este orden:</p>
+
+<div class="callout callout-tip">
+  <p class="callout-label">Capa 1 — El contenedor</p>
+  <p><code>docker compose logs -f ministack</code>. Ahí salen los logs de las Lambdas (los workers de MiniStack), los eventos del Event Source Mapping SQS y cualquier crash del emulador. Un comando que sirve: <code>docker compose logs ministack | grep ESM</code>.</p>
+</div>
+
+<div class="callout callout-warning">
+  <p class="callout-label">Capa 2 — CloudWatch Logs (emulado)</p>
+  <p>MiniStack emula CloudWatch Logs en el :4566. <code>serverless logs -f createOrder -t</code> consulta un CloudWatch emulado para traer los logs del handler. En AWS real es el mismo comando.</p>
+</div>
+
+<div class="callout callout-danger">
+  <p class="callout-label">Capa 3 — El estado de los recursos</p>
+  <p>¿Existe la tabla? ¿La cola? ¿La state machine? Se consulta directo contra MiniStack con la AWS CLI usando <code>--endpoint-url http://localhost:4566</code>.</p>
+</div>
+
+<h2>Caso de estudio: el crash del contenedor app (histórico)</h2>
+
+<p><em>Este caso documenta un fallo del setup anterior (contenedor <code>app</code> + serverless-offline), que es el que motivó el bootstrap actual. El contenedor <code>app</code> ya no existe en el proyecto; el aprendizaje (leer el error en capas, matriz de versiones) sigue siendo válido.</em></p>
+
+<p>Ahora apliquemos las capas al fallo real:</p>
+
+<h3>Paso 1 — Capa 1: ver los logs del contenedor (diagnóstico)</h3>
+
+<pre><code>docker compose ps
+# CONTAINER   SERVICE   STATUS
+# app         app       Restarting (1) 5 seconds ago   ← crash-loop
+
+docker logs serverless-order-pipeline-app 2>&1 | tail -20</code></pre>
+
+<p>El log mostraba repetidamente:</p>
+
+<pre><code>Error [ERR_REQUIRE_ESM]: require() of ES Module
+/app/node_modules/serverless-offline/src/index.js not supported.
+Instead change the require of index.js in null to a dynamic import()
+which is available in all CommonJS modules.</code></pre>
+
+<h3>Paso 2 — Leer el error con los ojos de la certificación</h3>
+
+<p>El error dice <code>ERR_REQUIRE_ESM</code>. Descomponé lo que pasa:</p>
+
+<ul>
+  <li>El paquete <code>serverless-offline@13.x</code> se publicó como <strong>módulo ES</strong> (<code>"type": "module"</code> en su package.json)</li>
+  <li>Node.js <strong>18.x no puede hacer <code>require()</code> de un módulo ES</strong> — esa capacidad se habilitó por defecto en Node 20.19 y 22.12</li>
+  <li>Serverless Framework 3 carga los plugins con <code>require()</code>, así que el plugin se rompe al cargarse</li>
+</ul>
+
+<div class="callout callout-tip">
+  <p class="callout-label">Diagnóstico equivocado que evitarías</p>
+  <p>No es un problema de tu código, ni de serverless.yml. Es un problema de <strong>matriz de versiones</strong>: plugin ESM + Node viejo. En la certificación, "matriz de versiones incompatible" es una distractor típico.</p>
+</div>
+
+<h3>Paso 3 — Capa 3: verificar el estado de MiniStack</h3>
+
+<p>Incluso con la capa 1 resuelta, confirmamos que MiniStack está vacío (nunca se desplegó el stack):</p>
+
+<pre><code>aws --endpoint-url http://localhost:4566 dynamodb list-tables        # []
+aws --endpoint-url http://localhost:4566 sqs list-queues             # []
+aws --endpoint-url http://localhost:4566 stepfunctions list-state-machines  # []</code></pre>
+
+<p>El contenedor <code>app</code> corría en <em>modo offline</em>: ese modo arrancaba las Lambdas en el puerto 3000, pero <strong>no creaba</strong> tabla, cola, tópico ni state machine. Esos tenían que existir ya en MiniStack. Hoy esa capa HTTP la cubre la API Gateway nativa que crea el bootstrap.</p>
+
+<h2>Ejercicio: diagnosticá vos mismo</h2>
+
+<ol>
+  <li>Corré <code>docker compose ps</code>. ¿Están los servicios <code>stackport</code> y <code>ministack</code> levantados?</li>
+  <li>Con <code>curl http://localhost:4566/health</code>, ¿está sano MiniStack?</li>
+  <li>Con la AWS CLI contra <code>:4566</code>, ¿cuántas tablas existen hoy?</li>
+  <li>Si corriste el bootstrap antes: consultá <code>docker compose logs ministack | grep ESM</code>. ¿Se ve el consumo de la cola?</li>
+</ol>
+
+<p>Cuando termines, contame qué viste y cómo clasificaste cada capa.</p>
+
+<h2>Quiz: Comprueba tu entendimiento</h2>
+
+<div class="quiz" data-correct="0" data-correct-text="Correcto. serverless.yml se traduce a un template CloudFormation, y CloudFormation es quien crea cada recurso." data-incorrect-text="Incorrecto. Recordá: Serverless Framework es un traductor — no crea nada directamente.">
+  <p class="quiz-question">¿Qué ocurre realmente al ejecutar serverless deploy?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Se genera y aplica un template CloudFormation</li>
+    <li class="quiz-option">Se compila el código de todas las funciones</li>
+    <li class="quiz-option">Se inician contenedores emulados en local</li>
+    <li class="quiz-option">Se publican los logs en CloudWatch</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="1" data-correct-text="Correcto. Api Gateway y Lambda se emulan en proceso; DynamoDB, SQS, SNS y Step Functions se buscan en MiniStack via endpoint." data-incorrect-text="Incorrecto. serverless-offline emula solo una parte — lo demás vive en MiniStack.">
+  <p class="quiz-question">En este proyecto, ¿qué emula serverless-offline?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Todos los servicios de la arquitectura</li>
+    <li class="quiz-option">API Gateway y Lambda solamente</li>
+    <li class="quiz-option">Solo las funciones de los handlers</li>
+    <li class="quiz-option">CloudWatch Logs de cada función</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="0" data-correct-text="Correcto. MiniStack deduce el servicio del scope de autorización, del header X-Amz-Target, o del path — todo en el puerto 4566." data-incorrect-text="Incorrecto. Recordá: un solo puerto, señal routing por headers/path.">
+  <p class="quiz-question">¿Cómo enruta MiniStack cada petición a su servicio?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Por scope de auth, X-Amz-Target o el path</li>
+    <li class="quiz-option">Por un subdominio distinto por servicio</li>
+    <li class="quiz-option">Porque cada servicio usa un puerto</li>
+    <li class="quiz-option">Por el nombre del bucket en la URL</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="2" data-correct-text="Correcto. La capa 1 es el log del contenedor que está fallando: ahí se ve el ERR_REQUIRE_ESM al arrancar serverless-offline." data-incorrect-text="Incorrecto. El diagnóstico arranca por el contenedor que está fallando, antes de mirar recursos.">
+  <p class="quiz-question">Un servicio de docker-compose está en "Restarting". ¿Dónde mirás primero?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">En la consola de CloudWatch real</li>
+    <li class="quiz-option">En las tablas de MiniStack con la CLI</li>
+    <li class="quiz-option">En los logs de ese contenedor (docker compose logs &lt;servicio&gt;)</li>
+    <li class="quiz-option">En el panel de DynamoDB Admin</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="callout callout-tip">
+  <p class="callout-label">¿Dudas?</p>
+  <p>Preguntame sobre cualquier concepto de esta lección, o sobre los comandos de diagnóstico. En la <strong><a href="0003-ministack-bootstrap-scripts.html">Lección 3</a></strong> vemos por qué el deploy completo no sirve contra el CF del emulador y cómo un script de bootstrap lo deja funcionando de punta a punta (SQS, Step Functions y SNS en vivo).</p>
+</div>
+
+<div class="lesson-nav">
+  <span><a href="0001-architecture-overview.html">← Lección 1: Arquitectura</a></span>
+  <span><a href="0003-ministack-bootstrap-scripts.html">Lección 3: Bootstrap con scripts →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

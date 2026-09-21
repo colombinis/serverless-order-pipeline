@@ -1,8 +1,14 @@
 # serverless-order-pipeline
 
-Pipeline serverless de fulfillment de órdenes en AWS, pensado como proyecto de práctica
+Pipeline de fulfillment de órdenes en AWS, pensado como proyecto de práctica
 para cubrir los "Preferred Skills" de una entrevista orientada a OMS de e-commerce +
 AWS serverless (Lambda, Step Functions, DynamoDB, SQS/SNS).
+
+> **Nota sobre el stack local**: el desarrollo local NO usa Serverless Framework.
+> Se usa **Docker Compose + MiniStack** (emulador de AWS, incluye API Gateway real)
+> + un **bootstrap script** que crea los recursos directamente contra el emulador
+> vía AWS CLI. El archivo `serverless.yml` es únicamente para el despliegue a AWS
+> real (`serverless deploy --stage prod`).
 
 ## Arquitectura
 
@@ -11,24 +17,24 @@ Cliente HTTP
      |
      v
 [API Gateway] --POST /orders--> [Lambda: createOrder]
-                                        |
-                                        |-- PutItem (status: PENDING) --> [DynamoDB: Orders]
-                                        |
-                                        '-- SendMessage --------------> [SQS: OrderQueue]
-                                                                              |
-                                                                              v
-                                                                [Lambda: processOrder]
-                                                                              |
-                                                                  StartExecution
-                                                                              v
-                                                          [Step Functions: OrderFulfillmentStateMachine]
-                                                                              |
-      ValidateStock -> ReserveInventory -> ChargePayment -> ConfirmOrder -> NotifyCustomer
-            |                  |                 |
-            '------------------'-----------------'--> (Catch) --> CancelOrder
-                                                                              |
-                                                              PublishMessage  v
-                                                                      [SNS: OrderNotificationsTopic]
+                                       |
+                                       |-- PutItem (status: PENDING) --> [DynamoDB: Orders]
+                                       |
+                                       '-- SendMessage --------------> [SQS: OrderQueue]
+                                                                             |
+                                                                             v
+                                                                            [Lambda: processOrder]
+                                                                             |
+                                                                           StartExecution
+                                                                           v
+                                                             [Step Functions: OrderFulfillmentStateMachine]
+                                                                             |
+                                                           ValidateStock -> ReserveInventory -> ChargePayment -> ConfirmOrder -> NotifyCustomer
+                                                                 |                  |                 |
+                                                                 '------------------'-----------------'--> (Catch) --> CancelOrder
+                                                                                                                                         |
+                                                                                                                                       PublishMessage  v
+                                                                                                                                                 [SNS: OrderNotificationsTopic]
 ```
 
 ## Por qué esta arquitectura (para hablar en la entrevista)
@@ -53,109 +59,111 @@ Cliente HTTP
 ## Requisitos previos
 
 ### Opción A: Desarrollo local con Docker + MiniStack (Recomendado)
-- Docker Desktop / Docker Engine + Docker Compose
-- **No requiere cuenta AWS real** - MiniStack emula 60+ servicios localmente
 
-### Opción B: Desarrollo local tradicional
+- Docker Desktop / Docker Engine + Docker Compose
+- **No requiere cuenta AWS real** — MiniStack emula 60+ servicios localmente.
+- **No se usa Serverless Framework** en el flujo local (ver bootstrap abajo).
+
+### Opción B: Despliegue a AWS real
+
 - Node.js 18+
 - Cuenta de AWS con credenciales configuradas (`aws configure`)
 - `npm install -g serverless` (o usar `npx serverless`)
 
-## Instalación
-
-### Opción A: Con Docker + MiniStack (Recomendado)
+## Instalación y arranque local (con Docker + MiniStack)
 
 ```bash
-# 1. Levanta la infraestructura: MiniStack + App + DynamoDB Admin + StackPort
+# 1. Levanta MiniStack (emula todos los servicios AWS, incluido API Gateway) + DynamoDB Admin + StackPort
 docker-compose up -d
 
 # 2. Espera a que MiniStack esté healthy (aprox. 10-15s)
-# Ver: curl http://localhost:4566/health
+curl http://localhost:4566/health
 
-# 3. Provisiona recursos + Lambdas directamente en MiniStack (bootstrap)
-npm run bootstrap:ministack
-#   Esto crea: tabla DynamoDB, cola SQS, tópico SNS, state machine, 8 Lambdas,
-#   event source mapping SQS→processOrder, y ejecuta un smoke test E2E.
+# 3. Provisiona TODOS los recursos directamente en MiniStack (bootstrap)
+scripts/ministack-bootstrap.sh
+#   Crea: API Gateway REST v1 (POST /orders → createOrder), tabla DynamoDB, cola
+#   SQS, tópico SNS, state machine, 8 Lambdas, event source mapping SQS→processOrder.
+#   Empaqueta el zip con zip nativo. Re-ejecutable (idempotente): actualiza el
+#   código de las Lambdas si ya existen. Al final imprime la URL del endpoint.
 
-# Ver logs de la app
-docker-compose logs -f app
-
-# Ver logs de MiniStack
+# Ver logs
 docker-compose logs -f ministack
 
 # Para bajar todo
 docker-compose down
 ```
 
-El endpoint de la API estará disponible en: `http://localhost:3000`
+El endpoint de la API lo imprime el bootstrap al terminar, y tiene la forma:
+`http://localhost:4566/restapis/{apiId}/dev/_user_request_/orders`
+(miniStack invoca una REST API por la ruta interna `_user_request_`).
 
-El panel de DynamoDB Admin en: `http://localhost:8001`
-
-**StackPort (AWS Resource Browser)** en: `http://localhost:8081`
-
-MiniStack health check: `curl http://localhost:4566/health`
-
-StackPort health check: `curl http://localhost:8081/api/health`
-
-### Opción B: Instalación tradicional
-
-```bash
-npm install
-```
+Paneles auxiliares:
+- DynamoDB Admin: `http://localhost:8001`
+- StackPort (AWS Resource Browser): `http://localhost:8081`
+- MiniStack health check: `curl http://localhost:4566/health`
+- StackPort health check: `curl http://localhost:8081/api/health`
 
 ## Desarrollo local
 
 ### Opción A: Con Docker + MiniStack (Recomendado - Full AWS emulation)
 
 ```bash
-# Levanta DynamoDB local + serverless-offline (API Gateway + Lambda emulados)
-# MiniStack emula TODOS los servicios: SQS, Step Functions, SNS, DynamoDB, etc.
+# 1. Levanta MiniStack + DynamoDB Admin + StackPort
 docker-compose up -d
 
-# Ver logs en tiempo real
-docker-compose logs -f app
+# 2. Opcional: ver logs en tiempo real
+docker-compose logs -f ministack
+
+# 3. Provisiona todo (idempotente)
+scripts/ministack-bootstrap.sh
 ```
 
 **Ventajas clave:**
-- ✅ **SQS, Step Functions, SNS funcionan nativamente** - `serverless-offline` solo emula HTTP + Lambda
-- ✅ **RDS Postgres real** - MiniStack levanta contenedor Postgres real en puerto 15432
-- ✅ **ElastiCache Redis real** - Contenedor Redis real en puerto 16379
-- ✅ **Multi-account / multi-region** - Aislamiento completo por Access Key ID
-- ✅ **Compatible con Terraform, CDK, Pulumi, AWS CLI, SDKs** - Drop-in replacement
+- ✅ **MiniStack emula API Gateway de verdad** (REST v1 de 86 ops y HTTP v2 de 42 ops). El bootstrap crea la REST API por control-plane (`create-rest-api` → `create-resource` → `put-method` → `put-integration` → `create-deployment`) y la engancha a las Lambdas, igual que en AWS. Se invoca con `/_user_request_/`.
+- ✅ **SQS, Step Functions, SNS funcionan nativamente** sobre MiniStack
+- ✅ **RDS Postgres real** — MiniStack levanta contenedor Postgres real en puerto 15432
+- ✅ **ElastiCache Redis real** — Contenedor Redis real en puerto 16379
+- ✅ **Multi-account / multi-region** — Aislamiento completo por Access Key ID
+- ✅ **Compatible con Terraform, CDK, Pulumi, AWS CLI, SDKs** — Drop-in replacement
+- ✅ **Lambda code hot-reload** — los cambios en `src/handlers/` se reflejan al re-correr el bootstrap
 
-### Opción B: Solo serverless-offline (Limitado)
+### Opción B: MiniStack solo (sin los paneles auxiliares)
 
 ```bash
-# Instala el plugin de DynamoDB local la primera vez
-sls dynamodb install
-
-# Levanta DynamoDB local + serverless-offline (API Gateway + Lambda emulados)
-npm run offline
+docker-compose up -d ministack
+# Luego corre el bootstrap: crea los recursos Y la API Gateway real en MiniStack:
+scripts/ministack-bootstrap.sh
 ```
 
-**Limitaciones conocidas:**
-- ❌ `serverless-offline` **NO emula SQS, Step Functions ni SNS**
-- ❌ Para flujo end-to-end completo sin AWS real, necesitas MiniStack o LocalStack
-- ✅ Sirve para pruebas unitarias de handlers HTTP + Lambda aislados
+Útil para probar handlers Lambda aislados contra MiniStack, o para
+integraciones con herramientas externas (StackPort, Terraform contra el emulador).
+El bootstrap crea la API Gateway igual que en la Opción A — no hay diferencia
+de capacidades, solo faltan DynamoDB Admin y StackPort.
 
-### Variables de entorno para desarrollo con MiniStack
+## Variables de entorno para desarrollo con MiniStack
 
-El `docker-compose.yml` configura automáticamente:
+El `docker-compose.yml` configura las credenciales de prueba en los containers, y
+el bootstrap (`COMMON_ENV` en `scripts/ministack-bootstrap.sh`) inyecta a las
+Lambdas las variables del entorno:
 
 ```bash
-IS_OFFLINE=true
-AWS_ENDPOINT_URL=http://ministack:4566
+AWS_ENDPOINT_URL=http://localhost:4566   # CLI contra el emulador
 AWS_REGION=us-east-1
 AWS_ACCESS_KEY_ID=123456789012
 AWS_SECRET_ACCESS_KEY=test
+ORDERS_TABLE=serverless-order-pipeline-orders-dev
+ORDER_QUEUE_URL=http://localhost:4566/123456789012/serverless-order-pipeline-order-queue-dev
+NOTIFICATIONS_TOPIC_ARN=arn:aws:sns:us-east-1:123456789012:serverless-order-pipeline-notifications-dev
+STATE_MACHINE_ARN=arn:aws:states:us-east-1:123456789012:stateMachine:OrderFulfillmentStateMachine
 ```
 
-En el código, `src/lib/dynamo.js` ya detecta `IS_OFFLINE` y apunta a `localhost:8000`. 
-Con MiniStack, el cliente DynamoDB usa `http://ministack:4566` automáticamente via `AWS_ENDPOINT_URL`.
+En el código, `src/lib/dynamo.js` detecta `IS_OFFLINE` y apunta a `localhost:8000`
+para DynamoDB local standalone; con MiniStack el cliente usa
+`http://ministack:4566` automáticamente vía `AWS_ENDPOINT_URL`.
 
 ## StackPort — Visualizador de recursos AWS
 
-**StackPort** es un panel web open-source para navegar e inspeccionar recursos en emuladores AWS (MiniStack, LocalStack, Moto) y cuentas AWS reales. En este proyecto se levanta como servicio en `docker-compose.yml`.
+**StackPort** es un panel web open-source para navegar e inspeccionar recursos en emuladores AWS (MiniStack, LocalStack, Moto) y cuentas AWS reales. Se levanta en `docker-compose.yml`.
 
 ### Qué puedes hacer con StackPort en este proyecto
 
@@ -167,34 +175,45 @@ Con MiniStack, el cliente DynamoDB usa `http://ministack:4566` automáticamente 
 | **Step Functions** | State machine `OrderFulfillmentStateMachine`, definiciones, ejecuciones |
 | **Lambda** | Las 8 funciones del proyecto, configuración, variables de entorno |
 | **CloudWatch Logs** | Logs de cada Lambda invocada |
-| **IAM** | Roles y políticas creadas por Serverless Framework |
+| **IAM** | Roles y políticas creadas por las Lambdas |
 
 ### Acceso
 
 - URL: `http://localhost:8081`
 - Health check: `curl http://localhost:8081/api/health`
-- API endpoints: `curl http://localhost:8081/api/endpoints`
 
-StackPort se conecta automáticamente a MiniStack vía `AWS_ENDPOINT_URL=http://ministack:4566` (configurado en docker-compose). No requiere configuración adicional.
+StackPort se conecta automáticamente a MiniStack vía `AWS_ENDPOINT_URL=http://ministack:4566`.
+No requiere configuración adicional.
 
 ## Scripts disponibles
 
 | Script | Qué hace |
 |--------|----------|
-| `npm run bootstrap:ministack` | **Provisiona todo en MiniStack**: tabla DynamoDB, cola SQS, tópico SNS, state machine, 8 Lambdas, event source mapping SQS→processOrder. Ejecuta smoke test E2E opcional (`SMOKE_TEST=0` para saltarlo). |
-| `npm run deploy:local` | `serverless deploy` contra MiniStack usando shim SDK v2 (`scripts/sls-v2-endpoint.js`). **Limitado**: MiniStack CF no soporta `TemplateURL` ni `Lambda::Version` → no materializa Lambdas reales. |
-| `npm run offline` | `serverless offline start` — emula solo API Gateway + Lambda en puerto 3000. **NO emula** SQS, Step Functions, SNS. |
+| `scripts/ministack-bootstrap.sh` | **Provisiona todo en MiniStack**: API Gateway REST v1 (POST /orders → createOrder), tabla DynamoDB, cola SQS, tópico SNS, state machine, 8 Lambdas, event source mapping SQS→processOrder. Empaqueta el zip con `zip` nativo (sin Serverless Framework). Idempotente. Al final imprime la URL del endpoint. |
+| `scripts/test.sh` | **Ejemplo de API Gateway real sobre MiniStack**: crea una REST API con `GET /saludo/{nombre}`, la enlaza a una Lambda y la invoca por `/_user_request_/`, verificando también los logs en CloudWatch. Útil para entender el control-plane del emulador. |
+| `npm test` | Jest con mocks del AWS SDK (`aws-sdk-client-mock`), sin necesidad de credenciales ni recursos reales. |
+| `npm run lint` | ESLint sobre `src/` y `tests/`. |
 
-### ¿Por qué `bootstrap:ministack` en vez de `serverless deploy`?
+### ¿Por qué un bootstrap script en vez de `serverless deploy`?
 
-MiniStack implementa CloudFormation, pero con **limitaciones conocidas**:
+MiniStack implementa CloudFormation, pero con **limitaciones conocidas** que hacen
+que el template generado por Serverless Framework no se materialice en el emulador:
+
 1. **No resuelve `TemplateURL`** — Serverless sube el template a S3 y pasa la URL; MiniStack exige `TemplateBody` (archivo local).
 2. **No crea `AWS::Lambda::Function` + `AWS::Lambda::Version`** — dependencias circulares no soportadas.
 3. **No valida IAM roles** — roles dummy son aceptados pero no funcionales.
 
-La solución: **provisionar data-plane directo vía AWS CLI** contra el endpoint MiniStack (:4566). El script `scripts/ministack-bootstrap.sh` es **idempotente** (re-actualiza código/env si el recurso existe) y usa los **mismos nombres** que `serverless.yml` para consistencia.
+**Importante:** estas limitaciones son del *CloudFormation* del emulador, **no** de
+su emulación de API Gateway. MiniStack emula API Gateway (REST v1 de 86 ops y HTTP
+v2 de 42 ops) completa por control-plane: el propio bootstrap crea la API real con
+la AWS CLI (`create-rest-api` → `create-resource` → `put-method` →
+`put-integration` → `create-deployment`) y la engancha a `createOrder`, igual que
+en AWS. No hace falta ningún servidor HTTP aparte.
 
-Ver detalles técnicos en: `learning-records/0005-ministack-deploy-and-lambda-env.md`
+La solución: **provisionar directo vía AWS CLI** contra el endpoint MiniStack (`:4566`),
+incluyendo el control-plane de API Gateway. El script es **idempotente** (re-actualiza
+código/env si el recurso existe) y usa los **mismos nombres** que `serverless.yml`
+para consistencia (el yml es la fuente de verdad solo para AWS real).
 
 ## Tests
 
@@ -205,27 +224,29 @@ npm test
 Corre Jest con mocks del AWS SDK (`aws-sdk-client-mock`), sin necesidad de
 credenciales ni recursos reales desplegados. Genera reporte de cobertura.
 
-## Probar el flujo completo (después de `bootstrap:ministack`)
+## Probar el flujo completo (después del bootstrap)
 
 ```bash
-# 1. Crear una orden (HTTP 201, escribe en DynamoDB, encola en SQS)
-curl -X POST http://localhost:3000/orders \
+# 1. Crear una orden (HTTP 201, escribe en DynamoDB, encola en SQS).
+#    Usa la URL que imprime el bootstrap (apiId = ID que reporta el script):
+curl -X POST http://localhost:4566/restapis/<apiId>/dev/_user_request_/orders \
   -H "Content-Type: application/json" \
   -d '{"customerId": "cust-123", "items": [{"sku": "ABC", "qty": 2}]}'
 
-# 2. El event source mapping SQS→processOrder dispara la Lambda automáticamente
-#    que invoca Step Functions StartExecution
-
-# 3. Ver el estado final en DynamoDB (usar orderId de la respuesta)
+# 2. Ver el estado final en DynamoDB (usar orderId de la respuesta)
 aws --endpoint-url http://localhost:4566 dynamodb get-item \
   --table-name serverless-order-pipeline-orders-dev \
   --key '{"orderId":{"S":"<orderId-del-paso-1>"}}'
 
-# 4. O ver la ejecución completa en Step Functions
+# 3. O ver las ejecuciones en Step Functions
 aws --endpoint-url http://localhost:4566 stepfunctions list-executions \
   --state-machine-arn arn:aws:states:us-east-1:123456789012:stateMachine:OrderFulfillmentStateMachine
 
-# Para forzar el camino de cancelación, mandar un qty mayor a 100 en algún item.
+# 4. O correr el smoke test del bootstrap (POST real a la API Gateway)
+scripts/ministack-bootstrap.sh SMOKE_TEST=1
+
+# Para bajar todo
+docker-compose down
 ```
 
 ## Mapeo contra los requisitos de la entrevista
@@ -237,14 +258,46 @@ aws --endpoint-url http://localhost:4566 stepfunctions list-executions \
 | Step Functions | `OrderFulfillmentStateMachine` en `serverless.yml` |
 | DynamoDB | `OrdersTable`, acceso vía `src/lib/orders.js` |
 | SNS | `OrderNotificationsTopic`, usado en `notifyCustomer` y `cancelOrder` |
-| REST API | Endpoint `POST /orders` vía API Gateway |
+| REST API | API Gateway real de MiniStack: `POST /orders` → `createOrder` (creada por el bootstrap vía CLI, invocada por `/_user_request_/`) |
 | Testing (unit tests) | `tests/` con Jest + `aws-sdk-client-mock` |
-| CI/CD | `.github/workflows/ci.yml` |
+| CI/CD | `.github/workflows/ci.yml` (deploy a AWS real con Serverless Framework) |
 | OMS / e-commerce | El dominio completo: orden -> stock -> inventario -> pago -> confirmación |
 
 ## Próximos pasos si querés extender el proyecto
 
-- Agregar un endpoint `GET /orders/{orderId}` para consultar estado.
+- Agregar un endpoint `GET /orders/{orderId}` para consultar estado (misma técnica:
+  `create-resource` + `put-method` + `put-integration` en el bootstrap).
 - Agregar un Dead Letter Queue (DLQ) a `OrderQueue` para mensajes que fallan repetidamente.
 - Agregar retries configurables (`Retry`) en los steps de la state machine además del `Catch`.
-- Sumar `serverless-offline` + LocalStack para poder correr el flujo end-to-end sin AWS real.
+- Probar el flujo con **LocalStack** en vez de MiniStack para comparar limitaciones.
+- Agregar monitoreo de métricas a CloudWatch (logs ya están configurados).
+
+## ¿Por qué a veces parece que "no se levantan todos los servicios"?
+
+Es normal confundirse por el siguiente punto:
+
+**MiniStack no materializa el template CloudFormation que genera Serverless
+Framework** (no resuelve `TemplateURL` y no soporta el ciclo de `Lambda::Version`).
+Por eso `serverless deploy` contra `:4566` no crea la API Gateway *desde el yml*.
+Pero esto **no** significa que MiniStack no pueda emular API Gateway: la emulación
+(REST v1 de 86 ops y HTTP v2 de 42 ops) funciona completa por control-plane, con la
+AWS CLI contra `:4566`. El bootstrap crea la REST API (`POST /orders` → `createOrder`)
+y la publica en el stage `dev`. Todo vive en **un solo servicio** de docker-compose:
+
+1. **`ministack` service** (puerto 4566): provee los servicios de data-plane (SQS, SNS, Step Functions, DynamoDB, RDS, Redis) **y API Gateway**. Se accede con `aws --endpoint-url http://localhost:4566`.
+
+Cuando ejecutas `docker-compose up -d` y luego `scripts/ministack-bootstrap.sh`,
+MiniStack queda con todos los recursos y la API Gateway publicada. Las Lambdas usan
+`AWS_ENDPOINT_URL=http://ministack:4566` para leer/escribir a la tabla, cola, state
+machine, etc. Las llamadas HTTP van a
+`http://localhost:4566/restapis/{apiId}/dev/_user_request_/orders` y
+MiniStack las enruta a la Lambda `createOrder` (integración AWS_PROXY), exactamente
+como haría AWS real.
+
+Si no corres el bootstrap, `docker-compose up -d` solo levanta el emulador vacío —
+no hay tabla, cola, Lambdas ni API todavía. Para el flujo completo necesitas el
+bootstrap (idempotente: correrlo dos veces no duplica nada).
+
+## Licencia
+
+MIT License.
