@@ -1,3 +1,14 @@
+# ⚠️ ARCHIVO SOLO PARA DESPLIEGUE A AWS REAL ⚠️
+# Este archivo de configuración del Serverless Framework NO se usa en el entorno local.
+# El despliegue local se realiza mediante:
+#   docker-compose up -d
+#   scripts/ministack-bootstrap.sh   (crea los recursos y la API Gateway REST v1 real en MiniStack)
+#
+# Para AWS real: `serverless deploy --stage prod`
+# Para local:  Ver README.md → "Opción A: Con Docker + MiniStack"
+#
+# ⚠️ ARCHIVO SOLO PARA DESPLIEGUE A AWS REAL ⚠️
+
 service: serverless-order-pipeline
 
 frameworkVersion: '3'
@@ -5,7 +16,6 @@ frameworkVersion: '3'
 plugins:
   - serverless-step-functions
   - serverless-offline
-  - serverless-dynamodb-local
 
 provider:
   name: aws
@@ -14,7 +24,10 @@ provider:
   stage: ${opt:stage, 'dev'}
   environment:
     ORDERS_TABLE: ${self:service}-orders-${self:provider.stage}
-    ORDER_QUEUE_URL: !Ref OrderQueue
+    # Emulator override: container sets ORDER_QUEUE_URL (MiniStack). Middle-ground
+    # default keeps real AWS deploy correct without !Ref (offline resolves the
+    # SQS Ref with a placeholder account that MiniStack cannot match).
+    ORDER_QUEUE_URL: ${env:ORDER_QUEUE_URL, 'https://sqs.${self:provider.region}.amazonaws.com/123456789012/${self:service}-order-queue-${self:provider.stage}'}
     NOTIFICATIONS_TOPIC_ARN: !Ref OrderNotificationsTopic
     STATE_MACHINE_ARN: !Ref OrderFulfillmentStateMachine
   iam:
@@ -147,10 +160,11 @@ resources:
         TopicName: ${self:service}-notifications-${self:provider.stage}
 
 custom:
-  dynamodb:
-    stages:
-      - dev
-    start:
-      port: 8000
-      inMemory: true
-      migrate: true
+  # En local no se usa este archivo: `scripts/ministack-bootstrap.sh` provisiona
+  # todo directo contra MiniStack (:4566), incluida una API Gateway REST v1 real
+  # (POST /orders → createOrder) creada por control-plane con la AWS CLI.
+  # serverless.yml es solo para AWS real, donde API Gateway la despliega el propio framework.
+  serverless-offline:
+    httpPort: 3000
+    host: 0.0.0.0
+    noPrependStageInUrl: true

@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lección 1: Arquitectura del Pipeline de Órdenes</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Lección 1: Arquitectura del Pipeline de Órdenes</h1>
+<p style="color: var(--color-muted); font-size: 0.85rem; margin-bottom: 2rem;">
+  Lección 1 de ∞ &middot; <a href="../MISSION.md">Misión</a> &middot; <a href="../RESOURCES.md">Recursos</a>
+</p>
+
+<h2>El mapa antes del territorio</h2>
+
+<p>Antes de profundizar en cada servicio, necesitas ver el bosque completo. Este proyecto es un <strong>pipeline de procesamiento de órdenes</strong> construido con 9 servicios AWS. Cada servicio tiene un rol preciso, y el orden en que se conectan no es arbitrario — resuelve problemas reales de concurrencia, tolerancia a fallos y acoplamiento.</p>
+
+<p>Vamos a recorrer el flujo completo de una orden, desde que el cliente hace POST hasta que recibe la notificación.</p>
+
+<h2>Diagrama de Arquitectura</h2>
+
+<div class="diagram">
+  <svg viewBox="0 0 800 420" xmlns="http://www.w3.org/2000/svg" style="max-width: 760px;">
+    <!-- API Gateway -->
+    <rect x="20" y="30" width="160" height="50" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d" stroke-width="1.5"/>
+    <text x="100" y="52" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1a1a1a">API Gateway</text>
+    <text x="100" y="68" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">POST /orders</text>
+
+    <!-- Arrow: API GW -> Lambda -->
+    <line x1="180" y1="55" x2="240" y2="55" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- Lambda: createOrder -->
+    <rect x="240" y="30" width="160" height="50" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d" stroke-width="1.5"/>
+    <text x="320" y="52" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1a1a1a">Lambda</text>
+    <text x="320" y="68" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">createOrder</text>
+
+    <!-- Arrow: Lambda -> DynamoDB (down) -->
+    <line x1="280" y1="80" x2="280" y2="140" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- DynamoDB -->
+    <rect x="200" y="140" width="160" height="50" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d" stroke-width="1.5"/>
+    <text x="280" y="162" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1a1a1a">DynamoDB</text>
+    <text x="280" y="178" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">OrdersTable</text>
+
+    <!-- Arrow: Lambda -> SQS (right-down) -->
+    <line x1="400" y1="55" x2="460" y2="55" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- SQS -->
+    <rect x="460" y="30" width="140" height="50" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d" stroke-width="1.5"/>
+    <text x="530" y="52" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1a1a1a">SQS</text>
+    <text x="530" y="68" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">OrderQueue</text>
+
+    <!-- Arrow: SQS -> Lambda (down) -->
+    <line x1="530" y1="80" x2="530" y2="140" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- Lambda: processOrder -->
+    <rect x="450" y="140" width="160" height="50" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d" stroke-width="1.5"/>
+    <text x="530" y="162" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1a1a1a">Lambda</text>
+    <text x="530" y="178" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">processOrder</text>
+
+    <!-- Arrow: processOrder -> Step Functions (down) -->
+    <line x1="530" y1="190" x2="530" y2="230" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+    <!-- Step Functions box -->
+    <rect x="330" y="230" width="400" height="170" rx="8" fill="#d94f3d" opacity="0.06" stroke="#d94f3d" stroke-width="1" stroke-dasharray="4"/>
+    <text x="530" y="250" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#d94f3d">Step Functions — OrderFulfillment</text>
+
+    <!-- States inside Step Functions -->
+    <rect x="345" y="265" width="110" height="35" rx="4" fill="white" stroke="#1a1a1a" stroke-width="1"/>
+    <text x="400" y="287" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#1a1a1a">ValidateStock</text>
+
+    <line x1="455" y1="282" x2="475" y2="282" stroke="#1a1a1a" stroke-width="1" marker-end="url(#arrow-sm)"/>
+
+    <rect x="475" y="265" width="110" height="35" rx="4" fill="white" stroke="#1a1a1a" stroke-width="1"/>
+    <text x="530" y="287" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#1a1a1a">ReserveInventory</text>
+
+    <line x1="585" y1="282" x2="605" y2="282" stroke="#1a1a1a" stroke-width="1" marker-end="url(#arrow-sm)"/>
+
+    <rect x="605" y="265" width="110" height="35" rx="4" fill="white" stroke="#1a1a1a" stroke-width="1"/>
+    <text x="660" y="287" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#1a1a1a">ChargePayment</text>
+
+    <line x1="660" y1="300" x2="660" y2="320" stroke="#1a1a1a" stroke-width="1" marker-end="url(#arrow-sm)"/>
+
+    <rect x="605" y="320" width="110" height="35" rx="4" fill="white" stroke="#1a1a1a" stroke-width="1"/>
+    <text x="660" y="342" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#1a1a1a">ConfirmOrder</text>
+
+    <line x1="605" y1="337" x2="585" y2="337" stroke="#1a1a1a" stroke-width="1" marker-start="url(#arrow-sm)"/>
+
+    <rect x="475" y="320" width="110" height="35" rx="4" fill="white" stroke="#1a1a1a" stroke-width="1"/>
+    <text x="530" y="342" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#1a1a1a">NotifyCustomer</text>
+
+    <!-- Catch arrows (dashed) -->
+    <path d="M400 300 Q400 370 475 370" fill="none" stroke="#d94f3d" stroke-width="1" stroke-dasharray="3"/>
+    <path d="M530 300 L530 370" fill="none" stroke="#d94f3d" stroke-width="1" stroke-dasharray="3"/>
+    <path d="M660 300 Q660 370 585 370" fill="none" stroke="#d94f3d" stroke-width="1" stroke-dasharray="3"/>
+
+    <!-- CancelOrder -->
+    <rect x="345" y="355" width="110" height="35" rx="4" fill="#d94f3d" opacity="0.15" stroke="#d94f3d" stroke-width="1.5"/>
+    <text x="400" y="377" text-anchor="middle" font-family="sans-serif" font-size="10" font-weight="600" fill="#d94f3d">CancelOrder</text>
+
+    <!-- SNS (bottom) -->
+    <line x1="530" y1="372" x2="530" y2="405" stroke="#1a1a1a" stroke-width="1" stroke-dasharray="3"/>
+    <rect x="650" y="370" width="110" height="35" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d" stroke-width="1.5"/>
+    <text x="705" y="392" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1a1a1a">SNS</text>
+    <text x="705" y="392" text-anchor="middle" font-family="sans-serif" font-size="9" fill="#6b6b6b" dy="12">Notifications</text>
+
+    <line x1="585" y1="337" x2="650" y2="380" stroke="#1a1a1a" stroke-width="1" stroke-dasharray="3" marker-end="url(#arrow-sm)"/>
+
+    <!-- Arrow markers -->
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+      </marker>
+      <marker id="arrow-sm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+      </marker>
+    </defs>
+  </svg>
+  <p class="diagram-caption">Flujo completo: HTTP → Lambda → SQS → Step Functions → SNS</p>
+</div>
+
+<h2>El flujo en 6 pasos</h2>
+
+<p>Cada petición HTTP recorre este camino. Vamos paso a paso:</p>
+
+<h3>1. El cliente envía POST /orders</h3>
+<p><strong>Amazon API Gateway</strong> (HTTP API v2) recibe la petición. API Gateway actúa como la puerta de entrada: autentica, valida el formato HTTP, y reenvía a Lambda. En este proyecto solo hay un endpoint (<code>POST /orders</code>), pero en producción podrías tener cientos.</p>
+
+<blockquote>
+  <strong>Concepto clave para certificación:</strong> HTTP API v2 es más barata y rápida que REST API v1, pero no tiene caching, WAF integration, ni API keys nativos. Elige según tus necesidades.
+</blockquote>
+
+<h3>2. createOrder escribe en DynamoDB y envía a SQS</h3>
+<p>El Lambda <code>createOrder</code> hace <strong>dos cosas</strong>: escribe la orden con estado <code>PENDING</code> en <strong>DynamoDB</strong>, y envía el <code>orderId</code> a <strong>SQS</strong>. Devuelve HTTP 201 inmediatamente — el procesamiento real es asíncrono.</p>
+
+<blockquote>
+  <strong>¿Por qué no procesar directamente?</strong> Si el Lambda procesara la orden completa, el cliente tendría que esperar 10-30 segundos (o más). Al devolver 201 y procesar async, el cliente obtiene respuesta en &lt;200ms. SQS absorbe picos de tráfico sin perder mensajes.
+</blockquote>
+
+<h3>3. processOrder lee SQS y arranca Step Functions</h3>
+<p>Otro Lambda (<code>processOrder</code>) está conectado a SQS como <em>event source</em>. Por cada mensaje, invoca una ejecución de <strong>Step Functions</strong> pasando el <code>orderId</code>. El <code>batchSize: 1</code> en la configuración garantiza un mensaje → una ejecución.</p>
+
+<h3>4. Step Functions orquesta 5 pasos secuenciales</h3>
+<p><strong>AWS Step Functions</strong> ejecuta una máquina de estados que coordina el cumplimiento de la orden:</p>
+
+<table>
+  <thead>
+    <tr><th>Estado</th><th>Qué hace</th><th>Servicio AWS</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>ValidateStock</td><td>Verifica que no haya items con cantidad &gt; 100</td><td>Lambda → DynamoDB</td></tr>
+    <tr><td>ReserveInventory</td><td>Simula reserva de inventario</td><td>Lambda → DynamoDB</td></tr>
+    <tr><td>ChargePayment</td><td>Simula cobro</td><td>Lambda → DynamoDB</td></tr>
+    <tr><td>ConfirmOrder</td><td>Marca orden como CONFIRMED</td><td>Lambda → DynamoDB</td></tr>
+    <tr><td>NotifyCustomer</td><td>Publica confirmación</td><td>Lambda → SNS</td></tr>
+  </tbody>
+</table>
+
+<p>Los primeros 3 estados tienen un bloque <code>Catch</code>: si cualquiera falla, el flujo se desvía a <code>CancelOrder</code> en lugar de abortar silenciosamente.</p>
+
+<h3>5. CancelOrder: el fallback</h3>
+<p>Si ValidateStock, ReserveInventory o ChargePayment fallan, Step Functions ejecuta <code>CancelOrder</code>: actualiza DynamoDB a <code>CANCELLED</code> y publica una notificación de cancelación vía SNS.</p>
+
+<h3>6. SNS notifica al mundo exterior</h3>
+<p><strong>Amazon SNS</strong> publica mensajes a un <em>topic</em>. En producción, suscribirías emails, SMS, Lambda, o WebHook aquí. En este proyecto, SNS es el punto de extensibilidad — agregar un nuevo consumidor no requiere modificar ningún código existente.</p>
+
+<h2>Los 9 servicios y su rol</h2>
+
+<table>
+  <thead>
+    <tr><th>Servicio</th><th>Rol en este proyecto</th><th>Patrón arquitectónico</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Lambda</strong></td><td>Compute sin servidor — 8 funciones</td><td>Event-driven, stateless</td></tr>
+    <tr><td><strong>API Gateway</strong></td><td>Puerta de entrada HTTP</td><td>Reverse proxy, throttling</td></tr>
+    <tr><td><strong>DynamoDB</strong></td><td>Estado persistente de órdenes</td><td>Key-value store, on-demand</td></tr>
+    <tr><td><strong>SQS</strong></td><td>Desacoplamiento async entre creación y procesamiento</td><td>Message queue, at-least-once</td></tr>
+    <tr><td><strong>SNS</strong></td><td>Notificaciones (confirmación/cancelación)</td><td>Fan-out, pub/sub</td></tr>
+    <tr><td><strong>Step Functions</strong></td><td>Orquestación del workflow de cumplimiento</td><td>State machine, error handling</td></tr>
+    <tr><td><strong>IAM</strong></td><td>Permisos de cada Lambda sobre los recursos</td><td>Least privilege</td></tr>
+    <tr><td><strong>CloudFormation</strong></td><td>Infraestructura como código (vía Serverless Framework)</td><td>Declarative, idempotent</td></tr>
+    <tr><td><strong>CloudWatch Logs</strong></td><td>Logging automático de cada Lambda</td><td>Observability</td></tr>
+  </tbody>
+</table>
+
+<h2>Quiz: Comprueba tu entendimiento</h2>
+
+<div class="quiz" data-correct="1" data-correct-text="Correcto. El Lambda escribe en DynamoDB (estado PENDING) y envía a SQS en la misma ejecución, devolviendo 201 rápido." data-incorrect-text="Incorrecto. Revisa el flujo: createOrder hace dos cosas antes de responder.">
+  <p class="quiz-question">¿Qué hace createOrder después de recibir la petición HTTP?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Procesa la orden completa y devuelve 200</li>
+    <li class="quiz-option">Escribe en DynamoDB y envía a SQS, devuelve 201</li>
+    <li class="quiz-option">Envía a Step Functions y espera la respuesta</li>
+    <li class="quiz-option">Solo guarda en DynamoDB y devuelve 201</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="0" data-correct-text="Correcto. SQS desacopla la creación del procesamiento, permitiendo respuesta rápida y absorción de picos." data-incorrect-text="Incorrecto. Piensa: ¿por qué no procesar todo en un solo Lambda?">
+  <p class="quiz-question">¿Cuál es el beneficio principal de usar SQS entre createOrder y processOrder?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Desacoplamiento async y absorción de picos de tráfico</li>
+    <li class="quiz-option">Encriptación de mensajes entre servicios</li>
+    <li class="quiz-option">Reducir el costo de Lambda ejecutando menos instancias</li>
+    <li class="quiz-option">Permitir que múltiples clientes escriban simultáneamente</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="2" data-correct-text="Correcto. El bloque Catch desvía a CancelOrder si cualquiera de los 3 primeros estados falla, garantizando que la orden quede en estado conocido." data-incorrect-text="Incorrecto. Revisa la sección de Step Functions y los bloques Catch.">
+  <p class="quiz-question">¿Qué pasa si ChargePayment falla en Step Functions?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">La máquina de estados se detiene y la orden queda en PENDING</li>
+    <li class="quiz-option">Step Functions reintenta automáticamente 3 veces</li>
+    <li class="quiz-option">Se ejecuta CancelOrder: DynamoDB se actualiza a CANCELLED y SNS publica</li>
+    <li class="quiz-option">Se reinicia la máquina desde ValidateStock</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Concepto clave: sync vs async</h2>
+
+<div class="callout callout-tip">
+  <p class="callout-label">Patrón</p>
+  <p>Este proyecto usa un patrón <strong>sync-then-async</strong>: el HTTP response es síncrono (rápido), pero el procesamiento real es asíncrono (SQS + Step Functions). Este es el patrón más común en serverless y aparece en casi todos los exámenes AWS.</p>
+</div>
+
+<p>La clave para la certificación: Lambda + SQS = desacoplamiento. Lambda + Step Functions = orquestación. Lambda + SNS = notificación fan-out. Cada combinación resuelve un problema diferente.</p>
+
+<h2>Lectura recomendada</h2>
+
+<p>Antes de la próxima lección, lee la sección de <a href="https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/general-design-principles.html">Design Principles</a> del AWS Well-Architected Serverless Applications Lens. Encontrarás los principios que guían las decisiones de este proyecto: <em>"Orchestrate with state machines, not functions"</em>, <em>"Use events to trigger transactions"</em>, y <em>"Design for failures and duplicates"</em>.</p>
+
+<h2>Siguiente lección</h2>
+
+<p>En la <a href="0002-serverless-yml-ministack.html">Lección 2: serverless.yml y el despliegue contra MiniStack</a> bajamos del diagrama al archivo que define toda esta infraestructura, y vemos dónde se miran los errores cuando algo no arranca.</p>
+
+<div class="callout callout-tip">
+  <p class="callout-label">¿Dudas?</p>
+  <p>Pregúntame sobre cualquier concepto de esta lección. Puedo explicar con más detalle, crear ejercicios adicionales, o saltar directamente al siguiente servicio.</p>
+</div>
+
+<div class="lesson-nav">
+  <span><a href="../MISSION.md">← Misión</a></span>
+  <span><a href="0002-serverless-yml-ministack.html">Lección 2: serverless.yml →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

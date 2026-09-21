@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cheatsheet: serverless.yml + debugging con MiniStack</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Cheatsheet: serverless.yml + debugging</h1>
+<p style="color: var(--color-muted); font-size: 0.85rem; margin-top: 0.25rem;">
+  <a href="../lessons/0002-serverless-yml-ministack.html">Lección 2</a> &middot; Documento de referencia rápida
+</p>
+
+<h2>serverless.yml — las secciones</h2>
+
+<table>
+  <thead>
+    <tr><th>Sección</th><th>Uso en este proyecto</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>service</code></td><td>Nombre del servicio; prefijo de recursos: <code>serverless-order-pipeline</code></td></tr>
+    <tr><td><code>frameworkVersion</code></td><td><code>'3'</code> — versión mayor del CLI</td></tr>
+    <tr><td><code>plugins</code></td><td><code>serverless-step-functions</code>, <code>serverless-offline</code></td></tr>
+    <tr><td><code>provider</code></td><td>Runtime <code>nodejs18.x</code>, región, <code>stage</code>, env vars, IAM role</td></tr>
+    <tr><td><code>functions</code></td><td>8 funciones: nombre → <code>src/handlers/&lt;name&gt;.handler</code> + events</td></tr>
+    <tr><td><code>stepFunctions</code></td><td>State machine <code>OrderFulfillmentStateMachine</code> (5 tasks + Catch)</td></tr>
+    <tr><td><code>resources</code></td><td>Raw CloudFormation: <code>OrdersTable</code>, <code>OrderQueue</code>, <code>OrderNotificationsTopic</code></td></tr>
+    <tr><td><code>custom</code></td><td><code>serverless-offline</code>: <code>host 0.0.0.0</code>, <code>httpPort 3000</code></td></tr>
+  </tbody>
+</table>
+
+<h2>Las dos sintaxis de referencias</h2>
+
+<ul>
+  <li><code>${self:service}</code>, <code>${self:provider.stage}</code> — interpolación de Serverless, resuelta por el CLI local</li>
+  <li><code>!Ref OrderQueue</code>, <code>!GetAtt OrdersTable.Arn</code> — funciones intrínsecas de CloudFormation, resueltas al desplegar</li>
+  <li><code>${opt:stage, 'dev'}</code> — variable de CLI con default: <code>--stage prod</code> la sobreescribe</li>
+</ul>
+
+<h2>Los dos modos de ejecución</h2>
+
+<table>
+  <thead>
+    <tr><th></th><th>Modo A: <code>serverless deploy</code></th><th>Modo B: <code>serverless offline</code></th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Qué emula</td><td>Nada local — crea todo en AWS o MiniStack</td><td>API Gateway + Lambda en proceso (puerto 3000)</td></tr>
+    <tr><td>DynamoDB/SQS/SNS/SFN</td><td>Creados por CloudFormation</td><td>Deben existir en MiniStack (:4566)</td></tr>
+    <tr><td>Env var clave</td><td><code>AWS_ENDPOINT_URL=http://localhost:4566</code></td><td><code>IS_OFFLINE=true</code> + <code>AWS_ENDPOINT_URL=http://ministack:4566</code></td></tr>
+    <tr><td>Cómo se apunta</td><td>aws CLI: <code>--endpoint-url http://localhost:4566</code>; serverless: <code>deploy:local</code> (SDK v2 no lee <code>AWS_ENDPOINT_URL</code>)</td><td>SDK: lee <code>AWS_ENDPOINT_URL</code> automáticamente</td></tr>
+  </tbody>
+</table>
+
+<h2>Las 3 capas de debugging</h2>
+
+<h3>Capa 1 — Contenedores</h3>
+<pre><code>docker compose ps                        # estado de cada contenedor
+docker compose logs -f app               # logs de serverless + Lambdas emuladas
+docker compose logs -f ministack         # logs del emulador
+docker logs serverless-order-pipeline-app 2>&1 | grep -A5 ERROR</code></pre>
+
+<h3>Capa 2 — CloudWatch Logs (emulado)</h3>
+<pre><code>sls logs -f createOrder -t               # tail de logs del handler, contra emulador
+sls logs -f createOrder                  # últimos logs sin seguimiento</code></pre>
+
+<h3>Capa 3 — Estado de los recursos (CLI contra :4566)</h3>
+<pre><code>EP=http://localhost:4566
+aws --endpoint-url $EP dynamodb list-tables
+aws --endpoint-url $EP sqs list-queues
+aws --endpoint-url $EP sns list-topics
+aws --endpoint-url $EP stepfunctions list-state-machines
+aws --endpoint-url $EP lambda list-functions
+aws --endpoint-url $EP cloudformation list-stacks --query 'StackSummaries[?StackStatus==`UPDATE_COMPLETE`].StackName'
+curl http://localhost:4566/health       # salud del emulador (63+ servicios)
+curl http://localhost:4566/_ministack/health</code></pre>
+
+<h2>Errores comunes y dónde aparecen</h2>
+
+<table>
+  <thead>
+    <tr><th>Síntoma</th><th>Causa típica</th><th>Dónde se ve</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>Restarting</code> del contenedor app</td><td>Crash al arrancar serverless (ej. plugin ESM + Node viejo)</td><td>Capa 1</td></tr>
+    <tr><td>Connection refused a :4566</td><td>MiniStack no levantado o <code>depends_on</code> no esperó</td><td>Capa 1 + health</td></tr>
+    <tr><td><code>ResourceNotFoundException</code></td><td>La tabla/cola/tópico no existe — nunca se desplegó</td><td>Capa 3</td></tr>
+    <tr><td>La Lambda lanza pero no ves logs</td><td>Buscar en CloudWatch emulado</td><td>Capa 2</td></tr>
+    <tr><td><code>AccessDenied</code> en AWS real</td><td>Role IAM incompleto en <code>provider.iam</code></td><td>Capa 1 + consola IAM</td></tr>
+    <tr><td><code>The security token included in the request is invalid</code> al desplegar</td><td><code>serverless deploy</code> corrió en el host sin <code>AWS_ENDPOINT_URL</code>: fue contra AWS real con credenciales del emulador</td><td>Capa 1 + capa 3</td></tr>
+    <tr><td><code>The CloudFormation template is invalid: TemplateBody is required</code></td><td>MiniStack no resuelve <code>TemplateURL</code> (template subido a S3) del deploy de serverless</td><td>Capa 3 (<code>describe-stack</code>)</td></tr>
+    <tr><td><code>QueueDoesNotExist</code> al mandar a SQS con offline</td><td>URL de cola con cuenta placeholder / host no resuelto; usar patrón <code>${env:ORDER_QUEUE_URL, fallback}</code></td><td>Capa 3 (<code>sqs receive-message</code>)</td></tr>
+  </tbody>
+</table>
+
+<h2>MiniStack — datos clave</h2>
+
+<ul>
+  <li>Un solo puerto <strong>4566</strong> para todos los servicios; se enruta por scope de auth / <code>X-Amz-Target</code> / path</li>
+  <li>No valida credenciales: cualquier access key funciona; la key de 12 dígitos se vuelve el <em>account id</em></li>
+  <li>Sin <code>PERSIST_STATE=1</code>, todo es efímero: reiniciás el contenedor y quedó con un estado limpio</li>
+  <li><code>JSON API</code> multi-account / multi-región: la región del scope SigV4 aísla recursos</li>
+  <li>Health: <code>curl http://localhost:4566/health</code> (aliases de LocalStack funcionan: <code>/_localstack/health</code>)</li>
+</ul>
+
+<h2>Comandos útiles del proyecto</h2>
+
+<pre><code>npm run offline          # serverless offline start  (puerto 3000)
+npm run bootstrap:ministack  # crea tabla/cola/tópico/SFN + 8 Lambdas + ESM SQS→processOrder en MiniStack (idempotente, smoke test)
+npm run deploy           # serverless deploy   (stage dev, EN TIEMPO REAL si no apuntás al emulador)
+npm run deploy:local     # serverless deploy contra MiniStack (shim SDK v2 → AWS_ENDPOINT_URL); llegarás al muro del CF del emulador
+npm run deploy:prod      # serverless deploy --stage prod
+# deploy:local usa el env del entorno. En el contenedor ya está MiniStack; en el host:
+#   AWS_ENDPOINT_URL=http://localhost:4566 npm run deploy:local
+npm test                 # Jest con mocks del SDK (sin AWS)
+npm run lint             # eslint src tests</code></pre>
+
+</body>
+</html>
