@@ -18,15 +18,26 @@ describe('createOrder handler', () => {
     sqsMock.reset();
   });
 
-  it('returns 400 when body is invalid JSON', async () => {
+  it('returns 400 (problem+json) when body is invalid JSON', async () => {
     const result = await handler({ body: '{invalid' });
     expect(result.statusCode).toBe(400);
+    expect(result.headers['Content-Type']).toBe('application/problem+json');
+    expect(JSON.parse(result.body).title).toBe('Malformed JSON');
   });
 
-  it('returns 400 when required fields are missing', async () => {
+  it('returns 422 (problem+json) when required fields are missing', async () => {
     const result = await handler({ body: JSON.stringify({ customerId: 'c1' }) });
-    expect(result.statusCode).toBe(400);
-    expect(JSON.parse(result.body).message).toMatch(/items/);
+    expect(result.statusCode).toBe(422);
+    expect(result.headers['Content-Type']).toBe('application/problem+json');
+    expect(JSON.parse(result.body).detail).toMatch(/items/);
+  });
+
+  it('returns 422 when an item has a non-positive qty', async () => {
+    const result = await handler({
+      body: JSON.stringify({ customerId: 'c1', items: [{ sku: 'ABC', qty: 0 }] }),
+    });
+    expect(result.statusCode).toBe(422);
+    expect(JSON.parse(result.body).detail).toMatch(/qty/);
   });
 
   it('creates an order, writes to DynamoDB and pushes to SQS', async () => {
@@ -44,6 +55,7 @@ describe('createOrder handler', () => {
     expect(result.statusCode).toBe(201);
     expect(parsed.status).toBe('PENDING');
     expect(parsed.orderId).toBeDefined();
+    expect(result.headers.Location).toBe(`/orders/${parsed.orderId}`);
 
     expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 1);
     expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 1);
@@ -96,9 +108,49 @@ describe('createOrder handler', () => {
 
     expect(result.statusCode).toBe(201);
     expect(parsed).toMatchObject({ orderId: 'ord-replay', status: 'PENDING', replay: true });
+    expect(result.headers.Location).toBe('/orders/ord-replay');
     expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 1);
     expect(ddbMock).toHaveReceivedCommandTimes(GetCommand, 1);
     expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+  });
+
+  it('returns 422 when the same idempotencyKey is reused with a different body', async () => {
+    ddbMock
+      .on(PutCommand)
+      .rejectsOnce(
+        Object.assign(new Error('ConditionalCheckFailedException'), {
+          name: 'ConditionalCheckFailedException',
+        })
+      );
+    ddbMock.on(GetCommand).resolves({
+      Item: { orderId: 'ord-replay', status: 'PENDING', requestHash: 'a-different-hash' },
+    });
+
+    const body = {
+      customerId: 'cust-123',
+      items: [{ sku: 'ABC', qty: 2 }],
+      idempotencyKey: 'key-42',
+    };
+
+    const result = await handler({ body: JSON.stringify(body) });
+
+    expect(result.statusCode).toBe(422);
+    expect(result.headers['Content-Type']).toBe('application/problem+json');
+    expect(JSON.parse(result.body).title).toBe('Idempotency key reuse');
+    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+  });
+
+  it('stores a requestHash when an idempotencyKey is provided', async () => {
+    ddbMock.on(PutCommand).resolves({});
+    sqsMock.on(SendMessageCommand).resolves({ MessageId: '1' });
+
+    await handler({
+      body: JSON.stringify({ customerId: 'c', items: [{ sku: 'A', qty: 1 }], idempotencyKey: 'k' }),
+    });
+
+    expect(ddbMock).toHaveReceivedCommandWith(PutCommand, {
+      Item: expect.objectContaining({ requestHash: expect.any(String) }),
+    });
   });
 
   it('produces different orderIds for different idempotencyKeys', async () => {

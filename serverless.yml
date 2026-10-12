@@ -61,6 +61,14 @@ functions:
           path: /orders
           method: post
 
+  # 1b. Read side: HTTP GET /orders/{orderId} -> current order state
+  getOrder:
+    handler: src/handlers/getOrder.handler
+    events:
+      - httpApi:
+          path: /orders/{orderId}
+          method: get
+
   # 2. SQS consumer: starts the Step Functions execution
   processOrder:
     handler: src/handlers/processOrder.handler
