@@ -24,6 +24,8 @@ provider:
   stage: ${opt:stage, 'dev'}
   environment:
     ORDERS_TABLE: ${self:service}-orders-${self:provider.stage}
+    INVENTORY_TABLE: ${self:service}-inventory-${self:provider.stage}
+    RESERVATIONS_TABLE: ${self:service}-reservations-${self:provider.stage}
     # Emulator override: container sets ORDER_QUEUE_URL (MiniStack). Middle-ground
     # default keeps real AWS deploy correct without !Ref (offline resolves the
     # SQS Ref with a placeholder account that MiniStack cannot match).
@@ -38,7 +40,11 @@ provider:
             - dynamodb:PutItem
             - dynamodb:GetItem
             - dynamodb:UpdateItem
-          Resource: !GetAtt OrdersTable.Arn
+            - dynamodb:TransactWriteItems
+          Resource: 
+            - !GetAtt OrdersTable.Arn 
+            - !GetAtt InventoryTable.Arn
+            - !GetAtt ReservationsTable.Arn
         - Effect: Allow
           Action:
             - sqs:SendMessage
@@ -157,6 +163,30 @@ resources:
           - AttributeName: orderId
             KeyType: HASH
         BillingMode: PAY_PER_REQUEST
+    
+    InventoryTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-inventory-${self:provider.stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: sku
+            AttributeType: S
+        KeySchema:
+          - AttributeName: sku
+            KeyType: HASH
+    
+    ReservationsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-reservations-${self:provider.stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: orderId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: orderId
+            KeyType: HASH
 
     OrderQueue:
       Type: AWS::SQS::Queue

@@ -27,6 +27,8 @@ SERVICE=serverless-order-pipeline
 STAGE=dev
 PREFIX="${SERVICE}-${STAGE}"
 TABLE="${SERVICE}-orders-${STAGE}"
+INVENTORY_TABLE="${SERVICE}-inventory-${STAGE}"
+RESERVATIONS_TABLE="${SERVICE}-reservations-${STAGE}"
 QUEUE="${SERVICE}-order-queue-${STAGE}"
 TOPIC="${SERVICE}-notifications-${STAGE}"
 STATE_MACHINE=OrderFulfillmentStateMachine
@@ -108,6 +110,29 @@ else
     --billing-mode PAY_PER_REQUEST >/dev/null
   ok "creada"
 fi
+
+# 2b. Tablas de inventario y reservas (Tarea 2)
+for spec in "sku:${INVENTORY_TABLE}" "orderId:${RESERVATIONS_TABLE}"; do
+  KEY="${spec%%:*}"; T="${spec##*:}"
+  info "DynamoDB ${T}"
+  if a dynamodb describe-table --table-name "$T" >/dev/null 2>&1; then
+    ok "ya existe"
+  else
+    a dynamodb create-table --table-name "$T" \
+      --attribute-definitions AttributeName=${KEY},AttributeType=S \
+      --key-schema AttributeName=${KEY},KeyType=HASH \
+      --billing-mode PAY_PER_REQUEST >/dev/null
+    ok "creada"
+  fi
+done
+
+# 2c. Sembrar inventario (re-ejecutable: sobrescribe la disponibilidad)
+info "Inventario inicial"
+a dynamodb put-item --table-name "$INVENTORY_TABLE" \
+  --item '{"sku":{"S":"ABC"},"available":{"N":"1000"}}' >/dev/null
+a dynamodb put-item --table-name "$INVENTORY_TABLE" \
+  --item '{"sku":{"S":"LIMITED"},"available":{"N":"5"}}' >/dev/null
+ok "ABC=1000, LIMITED=5"
 
 # 3. Colas SQS: DLQ + cola principal con redrive
 DLQ="${QUEUE}-dlq"
@@ -200,6 +225,8 @@ COMMON_ENV="Variables={
   AWS_ENDPOINT_URL=http://ministack:4566,
   AWS_REGION=${REGION},
   ORDERS_TABLE=${TABLE},
+  INVENTORY_TABLE=${INVENTORY_TABLE},
+  RESERVATIONS_TABLE=${RESERVATIONS_TABLE},
   ORDER_QUEUE_URL=${QUEUE_URL},
   NOTIFICATIONS_TOPIC_ARN=${TOPIC_ARN},
   STATE_MACHINE_ARN=${STATE_MACHINE_ARN}
