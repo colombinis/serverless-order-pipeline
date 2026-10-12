@@ -28,6 +28,24 @@
   Primary source for API Gateway: HTTP API vs REST API, throttling, authorization. Use for: understanding the POST /orders endpoint.
 - [AWS Certified Solutions Architect — Official Practice Question Sets](https://explore.skillbuilder.aws/learn/course/external/view/elearning/13406/aws-certified-solutions-architect-associate-official-practice-question-sets-saa-c03)
   Official practice questions from AWS. Use for: testing understanding against real exam format.
+- [RFC 9110 — HTTP Semantics: 201 Created (15.3.2) y 202 Accepted (15.3.3)](https://www.rfc-editor.org/rfc/rfc9110.html)
+  The authoritative definitions of the success status codes. Use for: deciding which 2xx a handler should return, arguing the contract behind POST /orders.
+- [MDN — 201 Created](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/201)
+  Readable summary of 201 quoting RFC 9110. Use for: quick reference on "resource created before the response is returned".
+- [MDN — 202 Accepted](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/202)
+  Readable summary of 202: non-committal, no way to send a later async response. Use for: quick reference on queue/batch semantics.
+- [AWS — Lambda Invoke API](https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html)
+  Official statement of the status codes per InvocationType: RequestResponse → 200, Event → 202, DryRun → 204. Use for: sync vs async invocation questions.
+- [AWS — Set up asynchronous invocation of the backend Lambda function](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-integration-async.html)
+  How API Gateway configures async Lambda invocation (X-Amz-Invocation-Type: Event) and why it can't return a payload. Use for: the 201-with-body vs 202-empty-body design fork.
+- [AWS — SQS standard queues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html)
+  Officially states standard queues are at-least-once: copies may be delivered and order can vary. Use for: why the consumer must be idempotent, and the standard-vs-FIFO tradeoff.
+- [AWS — Step Functions StartExecution API](https://docs.aws.amazon.com/step-functions/latest/apireference/API_StartExecution.html)
+  Documents that StartExecution is idempotent for STANDARD workflows (same name+input returns the existing execution) and raises ExecutionAlreadyExists for closed executions or different input. Use for: the deterministic-execution-name fix in processOrder.
+- [AWS — DynamoDB TransactWriteItems](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html)
+  Atomic multi-item writes, up to 100 items / 4 MB. Use for: the transaction outbox pattern and money-movement consistency.
+- [AWS Lambda Powertools — Idempotency](https://docs.powertools.aws.dev/lambda/python/latest/utilities/idempotency/)
+  Reference implementation of the idempotency-key pattern (INPROGRESS/COMPLETE records, concurrent-request protection, default 1h window). Use for: the API-layer cure for duplicate POSTs.
 - [AWS FAQ Pages](https://aws.amazon.com/faqs/)
   Service-specific FAQs are the highest-yield exam prep. Prioritize: Lambda FAQ, DynamoDB FAQ, SQS FAQ, Step Functions FAQ. Use for: limits, pricing gotchas, edge cases.
 

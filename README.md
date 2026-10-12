@@ -190,6 +190,7 @@ No requiere configuración adicional.
 | Script | Qué hace |
 |--------|----------|
 | `scripts/ministack-bootstrap.sh` | **Provisiona todo en MiniStack**: API Gateway REST v1 (POST /orders → createOrder), tabla DynamoDB, cola SQS, tópico SNS, state machine, 8 Lambdas, event source mapping SQS→processOrder. Empaqueta el zip con `zip` nativo (sin Serverless Framework). Idempotente. Al final imprime la URL del endpoint. |
+| `scripts/local-invoke.js` | **Invocá un handler en proceso** (sin emulador de Lambda), con breakpoints desde VSCode: `node scripts/local-invoke.js createOrder`. Apunta a MiniStack (`:4566`) con las mismas vars del bootstrap. Perfecto para depurar paso a paso cada función. |
 | `scripts/test.sh` | **Ejemplo de API Gateway real sobre MiniStack**: crea una REST API con `GET /saludo/{nombre}`, la enlaza a una Lambda y la invoca por `/_user_request_/`, verificando también los logs en CloudWatch. Útil para entender el control-plane del emulador. |
 | `npm test` | Jest con mocks del AWS SDK (`aws-sdk-client-mock`), sin necesidad de credenciales ni recursos reales. |
 | `npm run lint` | ESLint sobre `src/` y `tests/`. |
@@ -248,6 +249,38 @@ scripts/ministack-bootstrap.sh SMOKE_TEST=1
 # Para bajar todo
 docker-compose down
 ```
+
+## Depurar paso a paso (VSCode, sin emulador de Lambda)
+
+Cada handler es **una función Node común** `(event, context)`. Eso permite
+invocarlo como proceso local contra MiniStack, con breakpoints reales:
+
+```bash
+node scripts/local-invoke.js createOrder
+node scripts/local-invoke.js validateStock --body '{"orderId":"123"}'
+node scripts/local-invoke.js processOrder --body '{"orderId":"123"}'   # wrapper SQS automático
+```
+
+El harness reutiliza los nombres y el endpoint del bootstrap
+(`AWS_ENDPOINT_URL=http://localhost:4566` + las mismas vars de `COMMON_ENV`).
+Tipos de evento:
+
+| Handler | Evento generado |
+|---|---|
+| `createOrder` | `{ body: '<json>' }` (API Gateway) |
+| `processOrder` | `{ Records: [{ body: '<json>' }] }` (SQS) |
+| el resto | `{ orderId, ... }` directo (Step Functions Task) |
+
+**Con VSCode**: este repo incluye `.vscode/launch.json` — usá *Run and Debug*
+("Invoke Lambda handler (local)"), poné un breakpoint en un handler (p.ej.
+`src/handlers/validateStock.js:15`) y la config te pide el nombre del handler.
+Para detenerte en el arranque (antes del primer `await`), usá la config con
+*"estallido frío"* (`stopOnEntry`).
+
+> Nota: no se puede hacer step-through **dentro de la cadena async**
+> SQS→SFN (cada paso corre en un contenedor separado). El patrón es:
+> debugear cada handler en aislamiento con `local-invoke.js` y validar el
+> encadenamiento con el smoke test del bootstrap + logs.
 
 ## Mapeo contra los requisitos de la proyecto
 

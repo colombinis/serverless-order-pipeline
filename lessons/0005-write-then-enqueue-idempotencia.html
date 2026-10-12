@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lección 5: El fallo clásico del patrón — write-then-enqueue e idempotencia</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Lección 5: El fallo clásico del patrón — write-then-enqueue e idempotencia</h1>
+<p style="color: var(--color-muted); font-size: 0.85rem; margin-bottom: 2rem;">
+  <a href="../MISSION.md">Misión</a> &middot; <a href="../RESOURCES.md">Recursos</a> &middot;
+  <a href="0004-201-vs-202-createOrder.html">Lección 4</a> &middot;
+  <a href="../reference/0003-idempotencia-y-consistencia-cheatsheet.html">Cheatsheet: idempotencia</a>
+</p>
+
+<div class="callout callout-danger">
+  <p class="callout-label">Caso real</p>
+  <p>En la Lección 4 quedó la pregunta en el aire: <em>&laquo;si <code>createOrder</code> escribe DynamoDB y <strong>después</strong> SQS, ¿qué pasa si el envío a SQS falla pero la escritura ya ocurrió?&raquo;</em>. Spoiler: <strong>en este proyecto pasaría algo malo, y el código lo demuestra</strong>. Esto es el fallo clásico del patrón sync-then-async y material de examen garantizado.</p>
+</div>
+
+<div class="callout callout-tip">
+  <p class="callout-label">Estado: fixes aplicados</p>
+  <p>Las curas A y C ya están en el código real: <code>createOrder</code> con idempotency key (orderId determinístico + condición <code>attribute_not_exists</code>) y <code>processOrder</code> con nombre de ejecución determinista + deglución de <code>ExecutionAlreadyExists</code>. 14 tests pasan. La cura B (outbox) queda como siguiente paso. Detalles en <a href="../learning-records/0009-idempotencia-fixes-aplicados.md">learning-records/0009</a>.</p>
+</div>
+
+<h2>Las dos mitades del problema</h2>
+
+<p>Esto parece una sola cosa, pero son dos problemas distintos con dos curas distintas:</p>
+
+<table>
+  <thead>
+    <tr><th>Problema</th><th>Pregunta</th><th>Ejemplo</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Consistencia</strong></td>
+      <td>¿Quedan los <em>estados</em> coherentes si algo falla a mitad de camino?</td>
+      <td>La orden quedó guardada (<code>PENDING</code>) pero el evento para procesarla nunca llegó → orden huérfana para siempre.</td>
+    </tr>
+    <tr>
+      <td><strong>Idempotencia</strong></td>
+      <td>¿Re-ejecutar la misma operación produce el <em>mismo resultado</em>, sin efectos duplicados?</td>
+      <td>El cliente reintenta el POST, o SQS redelivera el mensaje → dos cargos, dos órdenes, dos confirmaciones.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>El principio 7 del <a href="https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/general-design-principles.html">AWS Well-Architected — Serverless Applications Lens</a> lo dice literal: <em>&laquo;Design for failures and duplicates: operations triggered from requests or events must be idempotent, as failures can occur and a given request or event can be delivered more than once&raquo;</em>.</p>
+
+<h2>Inventario de fallos en el código real</h2>
+
+<p>No es teoría: cada fila de esta tabla es verificable hoy en <code>src/</code>.</p>
+
+<table>
+  <thead>
+    <tr><th>Punto de fallo</th><th>Qué hace el código hoy</th><th>Consecuencia</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>PutCommand</code> OK, <code>SendMessage</code> falla</td>
+      <td><code>createOrder</code> lanza y API Gateway responde error (502 con proxy integration). La fila <code>PENDING</code> <strong>ya quedó escrita</strong>.</td>
+      <td><strong>Orden huérfana</strong>: nadie la va a procesar jamás. Es el fallo de consistencia.</td>
+    </tr>
+    <tr>
+      <td>El cliente reintenta el POST</td>
+      <td>Cada POST genera <code>orderId = uuidv4()</code> nuevo. No hay key de idempotencia.</td>
+      <td><strong>Orden duplicada</strong>. El retry de un cliente no recibe la orden original: crea otra.</td>
+    </tr>
+    <tr>
+      <td>SQS redelivera un mensaje</td>
+      <td>La cola es <strong>estándar</strong>: <em>&laquo;at-least-once ... more than one copy of a message might be delivered&raquo;</em> (fuente: <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html">SQS standard queues</a>). Visibility timeout 60&nbsp;s: si el consumidor falla, el mensaje vuelve.</td>
+      <td>El <strong>mismo</strong> <code>orderId</code> puede procesarse dos veces.</td>
+    </tr>
+    <tr>
+      <td><code>processOrder</code> arranca la ejecución</td>
+      <td><code>name: \`order-\${orderId}-\${Date.now()}\`</code> — nombre <strong>único por llamada</strong>.</td>
+      <td>Redelivery = <strong>ejecución nueva</strong> → el workflow completo corre dos veces → doble cargo.</td>
+    </tr>
+    <tr>
+      <td>Los Tasks actualizan estado</td>
+      <td><code>updateOrderStatus</code> hace un <code>UpdateCommand</code> <strong>sin <code>ConditionExpression</code></strong> (actualización ciega).</td>
+      <td>Re-ejecutar un paso no encuentra ninguna barrera.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>El punto fino que el examen adora: StartExecution ya es idempotente… si lo dejás</h2>
+
+<p>Aquí está la joya. La API <code>StartExecution</code> de Step Functions es <strong>idempotente para workflows STANDARD</strong> (que es el tipo de esta state machine): si llamás con el <strong>mismo nombre y el mismo input</strong> mientras esa ejecución está corriendo, <strong>la llamada devuelve el ARN de la ejecución ya existente</strong> en vez de crear otra. De la fuente oficial: <a href="https://docs.aws.amazon.com/step-functions/latest/apireference/API_StartExecution.html">StartExecution</a> — <em>&laquo;StartExecution is idempotent for STANDARD workflows. For a STANDARD workflow, if you call StartExecution with the same name and input as a running execution, the call succeeds and return the same response as the original request&raquo;</em>.</p>
+
+<p>Pero el código de <code>processOrder.js</code> le mete <code>Date.now()</code> al nombre:</p>
+
+<pre><code>// Hoy (rompe la idempotencia):
+name: `order-${orderId}-${Date.now()}`
+
+// Fix de UNA línea (la deja trabajar):
+name: `order-${orderId}`</code></pre>
+
+<p>Con el nombre fijo, el SQS redelivery de <code>order-abc</code> recibe <em>la misma ejecución</em> — el duplicado se absorbe gratis y de forma atómica, sin consultar la tabla. Ese es el tipo de detalle que separa una implementacion correcta de una excelente.</p>
+
+<div class="callout callout-warning">
+  <p class="callout-label">Los límites de la idempotencia de SFN</p>
+  <p>Solo aplica mientras la ejecución <strong>esté corriendo</strong>. Si la ejecución ya cerró (SUCCEEDED/FAILED) y llega el duplicado, <code>StartExecution</code> responde <code>ExecutionAlreadyExists</code> (400). Una ejecución cerrada no se reutiliza → ahí necesitás la cura C (consumidor con guardas), no solo el nombre fijo. La fuente lo dice: <em>&laquo;if the execution is closed or the input is different, it returns a 400 ExecutionAlreadyExists error&raquo;</em>.</p>
+</div>
+
+<h2>Las 3 curas del patrón</h2>
+
+<h3>A. Idempotency key en la API (cura los duplicados del cliente)</h3>
+
+<p>El cliente manda una key estable (<code>Idempotency-Key</code> en el header o en el body). <code>createOrder</code> la guarda como clave (o con una condición <code>attribute_not_exists</code>); si llega un retry con la misma key, <strong>devuelve el mismo <code>orderId</code></strong> en vez de crear otro. Es el patrón del decorador <code>@idempotent</code> de <a href="https://docs.powertools.aws.dev/lambda/python/latest/utilities/idempotency/">AWS Lambda Powertools</a>: guarda un registro <code>INPROGRESS → COMPLETE</code> en DynamoDB con la key, y re-sirve la respuesta guardada mientras la ventana (1&nbsp;hora por defecto) no expire. También te protege de dos POST idénticos <strong>concurrentes</strong>, que es peor que el retry secuencial.</p>
+
+<h3>B. Transaction outbox (cura la consistencia)</h3>
+
+<p>El problema raíz del fallo de consistencia es que la escritura y el enqueue son <strong>dos sistemas sin transacción</strong>. La cura canónica en serverless es el <strong>outbox</strong>: escribir la orden <em>y el evento</em> en la <strong>misma transacción</strong> de DynamoDB (<code>TransactWriteItems</code>), y que un <code>DynamoDB Streams</code> reenvíe los eventos a SQS.</p>
+
+<div class="diagram">
+  <svg viewBox="0 0 760 210" xmlns="http://www.w3.org/2000/svg" style="max-width: 720px;">
+    <text x="180" y="20" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1a1a1a">Hoy: dos sistemas, sin transacción</text>
+    <rect x="60" y="36" width="120" height="44" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d"/>
+    <text x="120" y="54" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">DynamoDB</text>
+    <text x="120" y="70" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">PutItem orden</text>
+    <rect x="260" y="36" width="120" height="44" rx="6" fill="#d94f3d" opacity="0.12" stroke="#d94f3d"/>
+    <text x="320" y="54" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">SQS</text>
+    <text x="320" y="70" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">SendMessage</text>
+    <line x1="180" y1="58" x2="260" y2="58" stroke="#d94f3d" stroke-width="1.5" marker-end="url(#ar)" stroke-dasharray="4"/>
+    <text x="220" y="48" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#d94f3d">puede fallar</text>
+    <text x="180" y="110" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">órdenes huérfanas PENDING si SQS falla</text>
+
+    <text x="560" y="20" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1a1a1a">Outbox: una sola transacción</text>
+    <rect x="400" y="36" width="130" height="44" rx="6" fill="#2d8a4e" opacity="0.12" stroke="#2d8a4e"/>
+    <text x="465" y="54" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">DynamoDB</text>
+    <text x="465" y="70" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">TransactWriteItems</text>
+    <rect x="540" y="36" width="120" height="44" rx="6" fill="#2d8a4e" opacity="0.12" stroke="#2d8a4e"/>
+    <text x="600" y="54" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#1a1a1a">Outbox</text>
+    <text x="600" y="70" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">evento "orden creada"</text>
+    <line x1="530" y1="58" x2="540" y2="58" stroke="#2d8a4e" stroke-width="1.5" marker-end="url(#ar)"/>
+    <line x1="600" y1="80" x2="600" y2="122" stroke="#2d8a4e" stroke-width="1.5" marker-end="url(#ar)"/>
+    <rect x="540" y="122" width="120" height="40" rx="6" fill="#2d8a4e" opacity="0.12" stroke="#2d8a4e"/>
+    <text x="600" y="146" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#1a1a1a">DynamoDB Streams</text>
+    <line x1="540" y1="142" x2="460" y2="142" stroke="#2d8a4e" stroke-width="1.5" marker-end="url(#ar)"/>
+    <rect x="340" y="122" width="120" height="40" rx="6" fill="#2d8a4e" opacity="0.12" stroke="#2d8a4e"/>
+    <text x="400" y="146" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#1a1a1a">Lambda → SQS</text>
+    <text x="540" y="196" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b6b6b">si la transacción no fue, el evento tampoco existió</text>
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a1a1a"/>
+      </marker>
+    </defs>
+  </svg>
+  <p class="diagram-caption">Izquierda: el fallo actual. Derecha: el outbox — la escritura y el evento nacen y mueren juntos, atómicamente.</p>
+</div>
+
+<p>La ventaja del outbox es total: <em>o la orden existe y su evento también, o no existe ninguno</em>. Nunca hay huérfanas ni eventos perdidos. Es el patrón que AWS recomienda cuando necesitás consistencia entre un estado y un evento.</p>
+
+<h3>C. Consumidor idempotente (cura los duplicados de SQS)</h3>
+
+<p>El consumidor debe ser idempotente por las dos vías: <strong>nombre de ejecución determinista</strong> (el fix de una línea de arriba) <strong>y guardas en las escrituras</strong> — convertir <code>updateOrderStatus</code> en una actualización condicional, p. ej. <code>ConditionExpression: '#status = :expected'</code> (solo pasar de <code>PENDING</code> a <code>PAYMENT_CHARGED</code> si el estado actual es el esperado). Así una segunda corrida no re-ejecuta el cargo: el <code>UpdateCommand</code> falla si el estado ya cambió, y el task puede tratarlo como no-op.</p>
+
+<h2>Tabla de examen: qué servicio te da qué</h2>
+
+<table>
+  <thead>
+    <tr><th>Servicio / primitiva</th><th>Garantía</th><th>Recordá para el examen</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>SQS estándar</td><td>At-least-once</td><td>Los duplicados son <strong>los esperados</strong>: diseñá el consumidor para ellos.</td></tr>
+    <tr><td>SQS FIFO</td><td>Dedupe + order (mayor costo, menor throughput)</td><td>Dedupe por <code>MessageDeduplicationId</code>; no elimina la necesidad de consumidor idempotente.</td></tr>
+    <tr><td><code>StartExecution</code> (STANDARD)</td><td><strong>Idempotente</strong>: mismo name+input → misma ejecución</td><td>Solo mientras la ejecución corre; cerrada → <code>ExecutionAlreadyExists</code>. EXPRESS no es idempotente.</td></tr>
+    <tr><td><code>TransactWriteItems</code></td><td>Escritura atómica multi-item (hasta 100 items / 4&nbsp;MB)</td><td>La base del outbox y de movimientos de dinero.</td></tr>
+    <tr><td><code>ConditionExpression</code></td><td>Escritura atómica con guarda lógica</td><td>El freebie de DynamoDB para no-ops e idempotencia.</td></tr>
+    <tr><td>DynamoDB Streams</td><td>Evento ordenado por ítem, at-least-once</td><td>El conector natural de un outbox hacia SQS o EventBridge.</td></tr>
+  </tbody>
+</table>
+
+<h2>Quiz: Comprueba tu entendimiento</h2>
+
+<div class="quiz" data-correct="0" data-correct-text="Correcto. El PutItem quedó escrito y SendMessage no llegó: orden huérfana PENDING, y el retry del cliente crea una segunda orden (uuid nuevo)." data-incorrect-text="Incorrecto. Fijate en el orden de las llamadas de createOrder: la escritura ya ocurrió y no hay rollback.">
+  <p class="quiz-question">¿Qué pasa si SendMessage falla después del PutItem en createOrder?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Orden huérfana PENDING y el retry del cliente duplica</li>
+    <li class="quiz-option">El mensaje se pierde y la tabla queda vacía</li>
+    <li class="quiz-option">La Lambda reintenta sola y al final lo logra</li>
+    <li class="quiz-option">DynamoDB revierte la escritura automáticamente</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="2" data-correct-text="Correcto. La cola estándar es at-least-once: está diseñada para poder entregar más de una copia de un mensaje." data-incorrect-text="Incorrecto. La fuente oficial: las colas estándar pueden entregar más de una copia.">
+  <p class="quiz-question">¿Por qué SQS estándar puede entregar un mensaje dos veces?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Porque el visibility timeout siempre es cero</li>
+    <li class="quiz-option">Porque garantiza exactamente una sola entrega</li>
+    <li class="quiz-option">Porque garantiza al menos una entrega con copias</li>
+    <li class="quiz-option">Porque los mensajes caducan a los cinco minutos</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="3" data-correct-text="Correcto. Nombre único por llamada = redelivery = ejecución nueva = el workflow completo corre dos veces (doble cargo)." data-incorrect-text="Incorrecto. Pensá en qué hace el sufijo Date.now() con la idempotencia de StartExecution.">
+  <p class="quiz-question">¿Qué efecto tiene `name: order-${orderId}-${Date.now()}` en processOrder?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Garantiza una sola ejecución por cada mensaje</li>
+    <li class="quiz-option">Reutiliza la ejecución anterior para ahorrar</li>
+    <li class="quiz-option">Repite la ejecución hasta que esté cerrada</li>
+    <li class="quiz-option">Anula la idempotencia y duplica al redeliverar</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="0" data-correct-text="Correcto. El outbox escribe la orden y el evento en la misma transacción; un stream reenvía a la cola. No hay huérfanas ni eventos perdidos." data-incorrect-text="Incorrecto. La cura de la consistencia une la escritura y el evento en una sola transacción atómica.">
+  <p class="quiz-question">¿Qué patrón cura el problema de consistencia write-then-enqueue?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Outbox con transacciones y reenvío vía streams</li>
+    <li class="quiz-option">Aumentar el visibility timeout de la cola</li>
+    <li class="quiz-option">Generar un uuid nuevo en cada petición</li>
+    <li class="quiz-option">Desactivar los reintentos de API Gateway</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Ejercicio: reproducí el duplicado con tus propias manos</h2>
+
+<ol>
+  <li>Levantá el entorno y corré el bootstrap: <code>./scripts/ministack-bootstrap.sh</code> (idempotente).</li>
+  <li>Hacé un <code>curl -X POST "$API_URL" -H "Content-Type: application/json" -d '{"customerId":"dup","items":[{"sku":"ABC","qty":2}]}'</code> dos veces, igualito.</li>
+  <li>Anotá los dos <code>orderId</code> que devuelve. ¿Son iguales? <em>Pista: no lo son</em> — cada POST creó una orden. Ese es el duplicado del cliente: sin idempotency key, retry = nueva orden.</li>
+  <li>Consultá DynamoDB: <code>aws --endpoint-url http://localhost:4566 dynamodb scan --table-name serverless-order-pipeline-orders-dev --query 'Items[].orderId'</code>. Hay dos filas para un solo &laquo;carrito&raquo;.</li>
+  <li><strong>Fix de una línea:</strong> cambiá el <code>name</code> de <code>processOrder.js</code> a <code>order-${orderId}</code>, actualizá la Lambda con el bootstrap y repetí el smoke test <code>curl</code>. Mismo mensaje redeliverado → misma ejecución SFN → el <code>chargePayment</code> corre una sola vez por orden.</li>
+</ol>
+
+<p>Después del ejercicio contame qué viste en las dos corridas antes y después del fix. Si querés, atacamos el siguiente nivel: agregar la <em>idempotency key</em> a <code>createOrder</code> con su test, o implementar el outbox con <code>TransactWriteItems</code> + Streams.</p>
+
+<h2>Lectura recomendada (fuente primaria)</h2>
+
+<p>El documento que junta todo es la sección de <a href="https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/general-design-principles.html">Design Principles del Serverless Applications Lens</a> — el principio <em>&laquo;Design for failures and duplicates&raquo;</em> es exactamente esta lección. Después, las dos fuentes de verdad técnicas: <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html">SQS standard queues</a> (at-least-once) y <a href="https://docs.aws.amazon.com/step-functions/latest/apireference/API_StartExecution.html">StartExecution</a> (idempotencia por nombre). Y la implementación lista para usar del patrón A: <a href="https://docs.powertools.aws.dev/lambda/python/latest/utilities/idempotency/">Lambda Powertools Idempotency</a>.</p>
+
+<div class="callout callout-tip">
+  <p class="callout-label">¿Dudas?</p>
+  <p>Preguntame lo que sea. ¿Querés que apliquemos el fix de la línea a <code>processOrder.js</code> y corramos los tests? ¿O que armemos el outbox para verlo funcionando en MiniStack?</p>
+</div>
+
+<div class="lesson-nav">
+  <span><a href="0004-201-vs-202-createOrder.html">← Lección 4: 201 vs 202</a></span>
+  <span><a href="../reference/0003-idempotencia-y-consistencia-cheatsheet.html">Cheatsheet de idempotencia →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

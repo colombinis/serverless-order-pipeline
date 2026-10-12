@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lección 4: 201 vs 202 — ¿qué código devuelve createOrder?</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Lección 4: 201 vs 202 — ¿qué código devuelve createOrder?</h1>
+<p style="color: var(--color-muted); font-size: 0.85rem; margin-bottom: 2rem;">
+  <a href="../MISSION.md">Misión</a> &middot; <a href="../RESOURCES.md">Recursos</a> &middot;
+  <a href="0001-architecture-overview.html">Lección 1</a> &middot;
+  <a href="../reference/0002-http-status-codes-api.html">Cheatsheet de códigos HTTP</a>
+</p>
+
+<div class="callout callout-danger">
+  <p class="callout-label">Caso real</p>
+  <p>Esta lección nace de una pregunta tuya sobre la Lección 1: <em>&laquo;createOrder devuelve 201, pero ¿no debería ser 202?&raquo;</em>. La respuesta corta es: <strong>202 es defendible, pero 201 es el código literalmente correcto aquí</strong> — porque el handler <em>sí</em> crea un recurso antes de responder. El comentario del código (que habla de un <code>202-style flow</code>) es el que está flojo, no la decisión.</p>
+</div>
+
+<h2>Las dos definiciones, sin adornos</h2>
+
+<p>Antes de decidir, mira qué dice la especificación. Estas no son opiniones: son definiciones de HTTP.</p>
+
+<table>
+  <thead>
+    <tr><th>Código</th><th>Qué afirma</th><th>Cuándo se usa</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>201 Created</strong></td>
+      <td>La petición produjo la <strong>creación de un recurso</strong>. El recurso ya existe cuando llega la respuesta.</td>
+      <td>El servidor creó algo identificable y puede señalarlo (por URL o <code>Location</code>).</td>
+    </tr>
+    <tr>
+      <td><strong>202 Accepted</strong></td>
+      <td>La petición fue <strong>aceptada para procesar</strong>, pero el procesamiento no terminó (o no empezó). No hay garantía de que se complete.</td>
+      <td>El trabajo lo hace otro proceso/servidor, o se procesa por lotes. Es un código <em>no comprometido</em>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>El texto exacto de la especificación: 201 significa que <em>&laquo;the HTTP request has led to the creation of a resource&raquo;</em> y que <em>&laquo;the new resource ... is created before the response is returned&raquo;</em>. 202 es <em>&laquo;non-committal&raquo;</em> — <em>&laquo;there is no way to later send an asynchronous HTTP response to indicate the outcome&raquo;</em>. Fuente: <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/201">MDN 201</a> y <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/202">MDN 202</a>, ambas citando la RFC 9110.</p>
+
+<div class="callout callout-tip">
+  <p class="callout-label">El discriminador</p>
+  <p>La pregunta que decide todo es una sola: <strong>¿el servidor creó un recurso identificable antes de responder?</strong> Si <em>sí</em> → 201. Si el recurso todavía no existe y solo se encoló trabajo → 202.</p>
+</div>
+
+<h2>Qué hace exactamente este handler</h2>
+
+<p>Mira el código real de <code>src/handlers/createOrder.js</code>. Hay tres cosas que ocurren <em>antes</em> del <code>return</code>:</p>
+
+<pre><code>const order = { orderId, customerId, items, status: 'PENDING', createdAt: now, updatedAt: now };
+
+await docClient.send(new PutCommand({ TableName: process.env.ORDERS_TABLE, Item: order }));   // 1) crea el recurso
+await sqsClient.send(new SendMessageCommand({ QueueUrl: ..., MessageBody: JSON.stringify({ orderId }) })); // 2) encola
+
+return response(201, { orderId, status: order.status });   // 3) devuelve su identificador</code></pre>
+
+<p>El handler <strong>crea una fila real en DynamoDB</strong> (con <code>orderId</code> y estado <code>PENDING</code>) y <strong>devuelve ese <code>orderId</code></strong>. Ese es exactamente el caso de uso de 201: la petición produjo un recurso nuevo, y el cuerpo lo identifica. El procesamiento pesado (Step Functions) es lo async — pero el <em>recurso orden</em> ya existe.</p>
+
+<blockquote>
+  <strong>Por qué NO es 202 aquí:</strong> 202 diría &laquo;acepté tu trabajo, pero todavía no hay nada&raquo;. Falso: la orden ya está persistida y el cliente puede consultarla. El estado <code>PENDING</code> no es &laquo;no creado&raquo; — es el <em>estado actual</em> de un recurso que sí existe.
+</blockquote>
+
+<div class="callout callout-warning">
+  <p class="callout-label">El comentario flojo</p>
+  <p>En el código <code>createOrder.js</code> hay un comentario que dice <em>&laquo;Returning fast here (202-style flow)&raquo;</em>. Eso describe la <strong>intención</strong> (responder rápido con procesamiento async), no el código que realmente devuelve. Confunde un <em>patrón</em> con un <em>código HTTP</em>. Patrón: sync-then-async. Código: 201. Son dos cosas distintas.</p>
+</div>
+
+<h2>El matiz que sí pregunta el examen: invocación sync vs async</h2>
+
+<p>Aquí está la parte que conecta con AWS. El código de arriba devuelve un cuerpo con el <code>orderId</code>. Eso solo es posible porque API Gateway invoca la Lambda <strong>de forma síncrona</strong> (<code>InvocationType: RequestResponse</code>, el default). Si la invocación fuera asíncrona, <strong>AWS te fuerza un 202 y borra el cuerpo</strong>:</p>
+
+<table>
+  <thead>
+    <tr><th></th><th>Invocación síncrona (este proyecto)</th><th>Invocación asíncrona</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Config</td><td><code>RequestResponse</code> (default)</td><td><code>X-Amz-Invocation-Type: Event</code> en la integración</td></tr>
+    <tr><td>Qué devuelve la API de Lambda</td><td><strong>200</strong> + el payload de la función</td><td><strong>202</strong> + solo el status code</td></tr>
+    <tr><td>Puede devolver <code>orderId</code>?</td><td>Sí — el handler arma la respuesta</td><td>No — el cliente no recibe payload</td></tr>
+    <tr><td>Quién encola el trabajo</td><td>El propio handler (escribe DynamoDB + SQS)</td><td>API Gateway / Lambda (fire-and-forget)</td></tr>
+  </tbody>
+</table>
+
+<p>Dato de la fuente oficial: en la API <code>Invoke</code> de Lambda, <em>&laquo;For the <code>RequestResponse</code> invocation type, this status code is 200. For the <code>Event</code> invocation type, this status code is 202.&raquo;</em> (<a href="https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html">AWS — Lambda Invoke API</a>). Y para configurar esa invocación async en API Gateway se usa el header <code>X-Amz-Invocation-Type: Event</code> (<a href="https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-integration-async.html">AWS — Set up asynchronous invocation</a>).</p>
+
+<div class="callout callout-tip">
+  <p class="callout-label">El fork de diseño</p>
+  <p><strong>Opción A (la del proyecto):</strong> la Lambda hace el enqueue y devuelve 201 con el <code>orderId</code>. El cliente conoce su recurso.<br>
+  <strong>Opción B:</strong> API Gateway invoca la Lambda async → 202 sin cuerpo. El cliente no recibe identificador; tendría que consultar por otro canal.<br>
+  Elegir entre 201 y 202 no es corregir un número: es elegir <em>qué contrato</em> le prometes al cliente.</p>
+</div>
+
+<h2>Consejo de precisión: el <code>Location</code> que falta</h2>
+
+<p>Una nota fina, para que tu 201 sea de libro: la RFC pide que un 201 <strong>identifique el recurso creado</strong> — idealmente con un header <code>Location: /orders/{orderId}</code>. Hoy el <code>orderId</code> va en el cuerpo, que también sirve, pero el <code>Location</code> es el sello canónico. Es una mejora de una línea en <code>src/lib/response.js</code>.</p>
+
+<h2>Quiz: Comprueba tu entendimiento</h2>
+
+<div class="quiz" data-correct="1" data-correct-text="Correcto. La pregunta decisiva es si el handler creó un recurso: aquí sí (fila PENDING con orderId), así que 201 es el código literal." data-incorrect-text="Incorrecto. La clave es si existe un recurso creado: aquí sí existe antes de responder.">
+  <p class="quiz-question">¿Cuál es el discriminador para elegir entre 201 y 202?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Si la respuesta tarda menos de doscientos milisegundos</li>
+    <li class="quiz-option">Si el servidor creó un recurso antes de responder</li>
+    <li class="quiz-option">Si la petición llegó por el método POST original</li>
+    <li class="quiz-option">Si el trabajo lo procesa otro microservicio interno</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="2" data-correct-text="Correcto. Si API Gateway invoca la Lambda async (InvocationType Event), la API de Lambda devuelve 202 y no hay payload: el cliente no recibe el orderId." data-incorrect-text="Incorrecto. Revisá la tabla: la invocación async devuelve 202 y solo el status code, sin cuerpo.">
+  <p class="quiz-question">¿Qué devuelve AWS si API Gateway invoca la Lambda de forma asíncrona?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Un 200 con el cuerpo completo de la función</li>
+    <li class="quiz-option">Un 201 con la ubicación del recurso creado</li>
+    <li class="quiz-option">Un 202 con el status code y sin cuerpo</li>
+    <li class="quiz-option">Un 204 sin cuerpo y sin identificador alguno</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<div class="quiz" data-correct="0" data-correct-text="Correcto. 202 diría que el trabajo se aceptó pero no hay recurso todavía; aquí la orden ya está persistida en DynamoDB como PENDING." data-incorrect-text="Incorrecto. El estado PENDING es el estado de un recurso que ya existe, no de un recurso inexistente.">
+  <p class="quiz-question">¿Por qué el estado PENDING no obliga a responder 202?</p>
+  <ul class="quiz-options">
+    <li class="quiz-option">Porque PENDING es el estado de un recurso ya creado</li>
+    <li class="quiz-option">Porque DynamoDB no soporta escrituras asíncronas</li>
+    <li class="quiz-option">Porque SQS garantiza entrega exactamente una vez</li>
+    <li class="quiz-option">Porque API Gateway reescribe todos los códigos</li>
+  </ul>
+  <div class="quiz-feedback"></div>
+</div>
+
+<h2>Lectura recomendada (fuente primaria)</h2>
+
+<p>Lee directamente la RFC 9110, secciones <a href="https://www.rfc-editor.org/rfc/rfc9110.html#status.201">15.3.2 (201 Created)</a> y <a href="https://www.rfc-editor.org/rfc/rfc9110.html#status.202">15.3.3 (202 Accepted)</a>. Son dos párrafos cada una y son el árbitro final de esta discusión. Para el lado AWS, la fuente de verdad es <a href="https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html">Invoke</a> más <a href="https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-integration-async.html">la invocación asíncrona</a>.</p>
+
+<h2>Siguiente lección</h2>
+
+<p>La pregunta natural que sigue: <em>si el handler escribe DynamoDB y <strong>después</strong> SQS, ¿qué pasa si el envío a SQS falla pero la escritura ya ocurrió?</em> Eso es idempotencia y consistencia — el fallo clásico de este patrón y material de examen. Ya está listo: <a href="0005-write-then-enqueue-idempotencia.html">Lección 5: write-then-enqueue e idempotencia</a>.</p>
+
+<div class="callout callout-tip">
+  <p class="callout-label">¿Dudas?</p>
+  <p>Pregúntame cualquier cosa de esta lección. ¿Querés que agreguemos el header <code>Location</code> al handler real y corramos los tests? ¿O que veamos el flujo async de API Gateway en vivo contra MiniStack?</p>
+</div>
+
+<div class="lesson-nav">
+  <span><a href="0003-ministack-bootstrap-scripts.html">← Lección 3: bootstrap</a></span>
+  <span><a href="0005-write-then-enqueue-idempotencia.html">Lección 5: fallos e idempotencia →</a></span>
+</div>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

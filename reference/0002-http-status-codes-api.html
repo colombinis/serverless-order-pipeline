@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cheatsheet: códigos HTTP del pipeline de órdenes</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Cheatsheet: códigos HTTP del pipeline</h1>
+<p style="color: var(--color-muted); font-size: 0.85rem; margin-top: 0.25rem;">
+  <a href="../lessons/0004-201-vs-202-createOrder.html">Lección 4</a> &middot; Documento de referencia rápida
+</p>
+
+<h2>Cómo elegir un código de éxito (2xx)</h2>
+
+<table>
+  <thead>
+    <tr><th>Código</th><th>Afirma</th><th>Requisito / uso</th><th>En este proyecto</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>200 OK</strong></td><td>La petición funcionó.</td><td>Respuesta genérica con cuerpo. El default de un <code>GET</code>.</td><td>Consultar/leer una orden.</td></tr>
+    <tr><td><strong>201 Created</strong></td><td>Se <strong>creó un recurso</strong>.</td><td>Idealmente con <code>Location</code> apuntando al recurso nuevo. Típico de <code>POST</code>.</td><td><code>POST /orders</code> → <code>createOrder</code> (crea la fila PENDING y devuelve <code>orderId</code>).</td></tr>
+    <tr><td><strong>202 Accepted</strong></td><td>Se <strong>aceptó para procesar</strong>; no terminó.</td><td>Non-committal: no hay forma de devolver el resultado luego. Trabajo en otro proceso o por lotes.</td><td>Sería el caso si API Gateway invocara la Lambda async (sin cuerpo).</td></tr>
+    <tr><td><strong>204 No Content</strong></td><td>Fue bien y <strong>no hay cuerpo</strong>.</td><td>Éxito sin representación. Típico de <code>DELETE</code> / <code>PUT</code> sin retorno.</td><td>Un <code>DELETE /orders/{id}</code> futuro.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout callout-tip">
+  <p class="callout-label">Regla de bolsillo</p>
+  <p><strong>¿Existe un recurso nuevo que puedo señalar?</strong> → <strong>201</strong>. &nbsp;<strong>¿Solo encolé trabajo y todavía no hay recurso?</strong> → <strong>202</strong>. &nbsp;<strong>¿Funcionó y no devuelvo nada?</strong> → <strong>204</strong>.</p>
+</div>
+
+<h2>Códigos de error frecuentes en este pipeline</h2>
+
+<table>
+  <thead>
+    <tr><th>Código</th><th>Significa</th><th>Dónde aparece aquí</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>400</strong></td><td>Bad Request — datos inválidos.</td><td><code>createOrder</code> si falta <code>customerId</code> o <code>items</code> está vacío.</td></tr>
+    <tr><td><strong>404</strong></td><td>Not Found — el recurso no existe.</td><td>Consulta de una orden con <code>orderId</code> inexistente.</td></tr>
+    <tr><td><strong>409</strong></td><td>Conflict — choque de estado.</td><td>Recrear una orden con un id duplicado (idempotencia).</td></tr>
+    <tr><td><strong>429</strong></td><td>Too Many Requests — throttling.</td><td>API Gateway o Lambda bajo ráfaga (<code>TooManyRequestsException</code>).</td></tr>
+    <tr><td><strong>500</strong></td><td>Internal Server Error — fallo del backend.</td><td>Error no capturado en un handler.</td></tr>
+    <tr><td><strong>502</strong></td><td>Bad Gateway — respuesta inválida de un upstream.</td><td>Una Lambda devuelve un <code>return</code> mal formado que API Gateway no puede interpretar.</td></tr>
+    <tr><td><strong>504</strong></td><td>Gateway Timeout — el upstream no respondió a tiempo.</td><td>La Lambda excede el timeout de integración de API Gateway (29&nbsp;s).</td></tr>
+  </tbody>
+</table>
+
+<h2>Invocación Lambda: qué status devuelve AWS</h2>
+
+<table>
+  <thead>
+    <tr><th>InvocationType</th><th>Status de la API Invoke</th><th>Devuelve payload?</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>RequestResponse</code> (default)</td><td><strong>200</strong></td><td>Sí — la respuesta de la función.</td></tr>
+    <tr><td><code>Event</code> (async)</td><td><strong>202</strong></td><td>No — solo el status code.</td></tr>
+    <tr><td><code>DryRun</code></td><td><strong>204</strong></td><td>No — solo valida permisos.</td></tr>
+  </tbody>
+</table>
+
+<p>Fuente: <a href="https://docs.aws.amazon.com/lambda/latest/api/API_Invoke.html">AWS Lambda — Invoke API</a>. Para configurar la invocación async en API Gateway: header <code>X-Amz-Invocation-Type: Event</code> (<a href="https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-lambda-integration-async.html">guía oficial</a>).</p>
+
+<h2>Definiciones canónicas (RFC 9110)</h2>
+
+<ul>
+  <li><a href="https://www.rfc-editor.org/rfc/rfc9110.html#status.201">201 Created</a> — <em>&laquo;the HTTP request has led to the creation of a resource&raquo;</em>; el recurso existe antes de responder.</li>
+  <li><a href="https://www.rfc-editor.org/rfc/rfc9110.html#status.202">202 Accepted</a> — <em>&laquo;non-committal&raquo;</em>; la petición se aceptó para procesar, sin garantía de resultado.</li>
+  <li>Resumen didáctico: <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/201">MDN 201</a> y <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/202">MDN 202</a>.</li>
+</ul>
+
+</body>
+</html>

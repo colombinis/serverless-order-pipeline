@@ -139,6 +139,8 @@
   <strong>¿Por qué no procesar directamente?</strong> Si el Lambda procesara la orden completa, el cliente tendría que esperar 10-30 segundos (o más). Al devolver 201 y procesar async, el cliente obtiene respuesta en &lt;200ms. SQS absorbe picos de tráfico sin perder mensajes.
 </blockquote>
 
+<p style="font-size: 0.9rem; color: var(--color-muted);"><em>Pregunta natural: ¿por qué 201 y no 202? Tiene trampa — lo desmenuzamos en la <a href="0004-201-vs-202-createOrder.html">Lección 4: 201 vs 202</a>.</em></p>
+
 <h3>3. processOrder lee SQS y arranca Step Functions</h3>
 <p>Otro Lambda (<code>processOrder</code>) está conectado a SQS como <em>event source</em>. Por cada mensaje, invoca una ejecución de <strong>Step Functions</strong> pasando el <code>orderId</code>. El <code>batchSize: 1</code> en la configuración garantiza un mensaje → una ejecución.</p>
 
