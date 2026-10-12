@@ -1,0 +1,150 @@
+openapi: 3.0.3
+info:
+  title: Order Pipeline API
+  version: 1.0.0
+  description: |
+    Order intake and read API for the serverless fulfillment pipeline.
+    `POST /orders` creates a PENDING order and hands it to an asynchronous
+    workflow (SQS -> Step Functions); `GET /orders/{orderId}` returns its state.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: /
+    description: Relative to the API stage (MiniStack locally, API Gateway stage in AWS)
+security: []
+paths:
+  /orders:
+    post:
+      operationId: createOrder
+      summary: Create an order for asynchronous fulfillment
+      description: |
+        Creates a PENDING order, persists it in DynamoDB and enqueues it in SQS.
+        The response is `201 Created` with a `Location` header pointing to the
+        new resource, because the order row exists before the response is sent
+        (fulfillment continues asynchronously).
+        Safe to retry: sending the same `idempotencyKey` with the same body
+        returns the same order; a different body with the same key is rejected
+        with `422`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrder'
+      responses:
+        '201':
+          description: Order created (status PENDING); fulfillment runs asynchronously
+          headers:
+            Location:
+              description: Relative URL of the created order
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderAccepted'
+        '400':
+          $ref: '#/components/responses/Problem'
+        '422':
+          $ref: '#/components/responses/Problem'
+  /orders/{orderId}:
+    get:
+      operationId: getOrder
+      summary: Read the current state of an order
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current order state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          $ref: '#/components/responses/Problem'
+components:
+  responses:
+    Problem:
+      description: Error in application/problem+json format (RFC 9457)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    CreateOrder:
+      type: object
+      required: [customerId, items]
+      properties:
+        customerId:
+          type: string
+          minLength: 1
+        idempotencyKey:
+          type: string
+          description: |
+            Optional. If provided, the orderId is derived from
+            (customerId + idempotencyKey), so a retry with the same key lands on
+            the same order instead of creating a duplicate.
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [sku, qty]
+            properties:
+              sku:
+                type: string
+                minLength: 1
+              qty:
+                type: integer
+                minimum: 1
+    OrderAccepted:
+      type: object
+      properties:
+        orderId:
+          type: string
+        status:
+          type: string
+          enum: [PENDING, STOCK_VALIDATED, INVENTORY_RESERVED, PAYMENT_CHARGED, CONFIRMED, CANCELLED]
+        replay:
+          type: boolean
+          description: Present and true when this response replays an existing order.
+    Order:
+      type: object
+      properties:
+        orderId:
+          type: string
+        customerId:
+          type: string
+        status:
+          type: string
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              sku:
+                type: string
+              qty:
+                type: integer
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    Problem:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
