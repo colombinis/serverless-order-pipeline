@@ -1,0 +1,10 @@
+# Write-then-enqueue: el usuario identificó solo el fallo clásico del patrón, y el nombre de ejecución con Date.now() lo confirmó
+
+Enlazando la pregunta de la Lección 4 (201 vs 202), el usuario pidió por sí mismo la lección sobre el fallo clásico del sync-then-async: "si el handler escribe DynamoDB y después SQS, ¿qué pasa si el envío a SQS falla pero la escritura ya ocurrió?". Eso demuestra que ya traza las consecuencias del patrón (encadenamiento de "¿201 o 202?" → "¿y si el enqueue falla?"), no solo memoriza el diagrama.
+
+Evidence: al leer el código real se confirmó que el agujero existe y es más profundo de lo que la pregunta suponía: (1) createOrder no tiene idempotency key y usa uuidv4() por POST → retry duplica la orden; (2) la cola es estándar (at-least-once por diseño); (3) processOrder usa `name: order-${orderId}-${Date.now()}` → un redelivery arranca una ejecución NUEVA de Step Functions → cargo doble; (4) updateOrderStatus es un update ciego sin ConditionExpression. Fix de una línea para (3): nombre determinista `order-${orderId}`, apoyado en la idempotencia documentada de StartExecution para workflows STANDARD.
+
+Implicaciones:
+- Lección 5 creada (`0005-write-then-enqueue-idempotencia.html`) + cheatsheet (`reference/0003-idempotencia-y-consistencia-cheatsheet.html`); GLOSSARY y RESOURCES actualizados.
+- El ZPD ahora habilita trabajo hands-on real: aplicar la idempotency key en createOrder con su test, el nombre determinista en processOrder, o el outbox con TransactWriteItems + DynamoDB Streams — idealmente con la reproducción del duplicado en MiniStack como ejercicio de la lección.
+- Cubrir en la lección 6 si se pide: la jerarquía de reintentos at-least-once del lado del evento (ESM, visibility timeout) y el límite de ExecutionAlreadyExists cuando la ejecución ya cerró.

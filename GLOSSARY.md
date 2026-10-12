@@ -7,7 +7,19 @@ Términos canónicos del arquitectura de este proyecto. Cada concepto se promuev
 **Sync-then-async**:
 Patrón donde la respuesta HTTP se completa rápido (síncrono) mientras el procesamiento real ocurre detrás (asíncrono), mediante colas y orquestadores.
 
-_Equivalente en frameworks no serverless_: Patrón request-response desacoplado, respuesta 202 Accepted con procesamiento en cola.
+_Nota_: el código HTTP de la respuesta NO está fijado por el patrón: `createOrder` devuelve 201 porque crea el recurso orden (fila PENDING con orderId). Un 202 sería apropiado solo si no existiera recurso creado (ver "201 Created" y "202 Accepted" más abajo).
+
+## Protocolo HTTP
+
+**201 Created**:
+Código de éxito que afirma que la petición produjo la creación de un recurso identificable, que ya existe cuando llega la respuesta. Idealmente con header `Location` apuntando al recurso nuevo.
+
+_En este proyecto_: `POST /orders` → `createOrder` escribe la fila en DynamoDB y devuelve 201 con el `orderId` en el cuerpo.
+
+**202 Accepted**:
+Código de éxito "no comprometido": la petición se aceptó para procesar, pero el procesamiento no terminó (o no empezó) y no hay forma de devolver su resultado luego.
+
+_En este proyecto_: es lo que AWS devolvería (sin cuerpo) si API Gateway invocara la Lambda de forma asíncrona (`InvocationType: Event`); no es lo que `createOrder` devuelve.
 
 **Desacoplamiento (decoupling)**:
 Separación entre productor y consumidor mediante un intermediario (SQS/SNS) que evita que el fallo o lentitud de uno afecte al otro.
@@ -58,6 +70,25 @@ Servicio de notificaciones fan-out que publica mensajes a suscriptores múltiple
 
 **Step Functions**:
 Orquestación de workflows mediante state machines, con estados transicionales y manejo de errores (`Catch`, `Retry`).
+
+## Consistencia e idempotencia
+
+**Idempotencia**:
+Propiedad por la cual re-ejecutar una operación con el mismo input produce el mismo resultado, sin efectos secundarios duplicados (dos órdenes, dos cargos, dos confirmaciones). La exige el Well-Architected Serverless Lens: *"design for failures and duplicates"*.
+
+_En este proyecto_: createOrder no tiene key de idempotencia (uuidv4() por POST → retry duplica) y processOrder usa un nombre de ejecución con `Date.now()` que anula la idempotencia de `StartExecution`.
+
+**At-least-once**:
+Garantía de entrega de SQS estándar: un mensaje se entrega al menos una vez, pero puede entregarse más de una vez (copias) y ocasionalmente fuera de orden. Los consumidores deben ser idempotentes.
+
+**Transacción outbox**:
+Patrón que escribe el estado y el evento (o mensaje) en la misma transacción atómica (DynamoDB `TransactWriteItems`) y reenvía el evento a la cola mediante `DynamoDB Streams`. Garantiza que no existan órdenes huérfanas ni eventos perdidos: si la transacción no fue, el evento tampoco existió.
+
+**Nombre de ejecución determinista**:
+Pasar a `StartExecution` el mismo `name` (y `input`) para un mismo `orderId`, de modo que la idempotencia nativa de Step Functions (workflows STANDARD) devuelva la ejecución ya existente en vez de crear otra. Con `Date.now()` en el nombre, la idempotencia no aplica.
+
+**Actualización condicional**:
+`UpdateCommand` de DynamoDB con `ConditionExpression` (p. ej. `#status = :expected`) que solo escribe si el estado actual coincide; si no, lanza `ConditionalCheckFailedException` y el paso puede tratarse como no-op. Es la guarda atómica para consumidores idempotentes.
 
 ## Depuración
 

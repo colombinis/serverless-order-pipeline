@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cheatsheet: idempotencia y consistencia en el pipeline</title>
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<h1>Cheatsheet: idempotencia y consistencia</h1>
+<p style="color: var(--color-muted); font-size: 0.85rem; margin-top: 0.25rem;">
+  <a href="../lessons/0005-write-then-enqueue-idempotencia.html">Lección 5</a> &middot; Documento de referencia rápida
+</p>
+
+<h2>Los dos problemas, sus 3 curas</h2>
+
+<table>
+  <thead>
+    <tr><th>Problema</th><th>Síntoma</th><th>Cura</th><th>Primitiva AWS</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Consistencia</strong></td>
+      <td>Escritura OK + enqueue fallido → orden huérfana (estado y evento no coinciden).</td>
+      <td>B. Transaction outbox</td>
+      <td><code>TransactWriteItems</code> + <code>DynamoDB Streams</code> → SQS</td>
+    </tr>
+    <tr>
+      <td rowspan="2"><strong>Idempotencia</strong></td>
+      <td>Cliente reintenta el POST → orden duplicada.</td>
+      <td>A. Idempotency key en la API</td>
+      <td>Key estable + condición <code>attribute_not_exists</code> / Powertools</td>
+    </tr>
+    <tr>
+      <td>SQS redelivera → workflow corre dos veces → cargo doble.</td>
+      <td>C. Consumidor idempotente</td>
+      <td>Nombre de ejecución determinista + <code>ConditionExpression</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Cómo está hoy el código (y su fix)</h2>
+
+<table>
+  <thead>
+    <tr><th>Archivo</th><th>Vulnerabilidad</th><th>Fix</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>src/handlers/createOrder.js</code></td>
+      <td>PutItem y SendMessage sin transacción; <code>uuidv4()</code> por POST (sin key de idempotencia).</td>
+      <td>Idempotency key del cliente guardada como clave / condición; o mover el enqueue a outbox.</td>
+    </tr>
+    <tr>
+      <td><code>src/handlers/processOrder.js</code></td>
+      <td><code>name: order-${orderId}-${Date.now()}</code> — anula la idempotencia de StartExecution.</td>
+      <td><code>name: order-${orderId}</code> (una línea).</td>
+    </tr>
+    <tr>
+      <td><code>src/lib/orders.js</code></td>
+      <td><code>UpdateCommand</code> ciego, sin condiciones: re-ejecutar un paso no tiene barrera.</td>
+      <td><code>ConditionExpression</code> con el estado esperado → segunda corrida es no-op.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Garantías de cada servicio (para el examen)</h2>
+
+<table>
+  <thead>
+    <tr><th>Servicio / primitiva</th><th>Garantía</th><th>Trampa del examen</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>SQS estándar</td><td>At-least-once</td><td>Duplicados son comportamiento esperado, no un bug.</td></tr>
+    <tr><td>SQS FIFO</td><td>Dedupe + orden</td><td>Menos throughput; no reemplaza consumidor idempotente.</td></tr>
+    <tr><td><code>StartExecution</code> STANDARD</td><td>Idempotente con mismo name+input</td><td>Solo mientras corre. Cerrada → <code>ExecutionAlreadyExists</code> (400). EXPRESS no idempotente.</td></tr>
+    <tr><td><code>TransactWriteItems</code></td><td>Atómico, hasta 100 items / 4 MB</td><td>Si un item falla, ninguno se escribe.</td></tr>
+    <tr><td><code>ConditionExpression</code></td><td>Guarda atómica por item</td><td>Ideal para transiciones de estado (PENDING → … ) y no-ops.</td></tr>
+    <tr><td>DynamoDB Streams</td><td>Evento por ítem, ordenado, at-least-once</td><td>Conector natural outbox → SQS/EventBridge.</td></tr>
+  </tbody>
+</table>
+
+<h2>Patrón outbox en 3 pasos</h2>
+
+<ol>
+  <li>POST /orders → <code>TransactWriteItems</code>: ítem <code>orders/{orderId}</code> + ítem <code>outbox/{orderId}</code> en la <strong>misma</strong> transacción.</li>
+  <li>DynamoDB Streams emite el insert del outbox (at-least-once, ordenado por ítem).</li>
+  <li>Una Lambda del stream envía el evento a SQS y borra el ítem del outbox (o usa TTL).</li>
+</ol>
+
+<p>Si la transacción falla, el evento nunca existió → sin huérfanas, sin eventos perdidos, sin duplicados de origen.</p>
+
+<h2>Cómo se ve un update idempotente</h2>
+
+<pre><code>await docClient.send(new UpdateCommand({
+  TableName: process.env.ORDERS_TABLE,
+  Key: { orderId },
+  UpdateExpression: 'SET #status = :new, updatedAt = :t',
+  ConditionExpression: '#status = :expected',   // guarda: solo si estaba en el estado esperado
+  ExpressionAttributeNames: { '#status': 'status' },
+  ExpressionAttributeValues: {
+    ':new': 'PAYMENT_CHARGED',
+    ':expected': 'INVENTORY_RESERVED',
+    ':t': new Date().toISOString(),
+  },
+}));
+// Si el estado actual no coincide -> ConditionalCheckFailedException -> tratar como no-op</code></pre>
+
+<h2>Fuentes de verdad</h2>
+
+<ul>
+  <li><a href="https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/general-design-principles.html">Design principles — Serverless Applications Lens</a>: <em>&laquo;Design for failures and duplicates&raquo;</em>.</li>
+  <li><a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html">SQS standard queues</a>: at-least-once, copias posibles.</li>
+  <li><a href="https://docs.aws.amazon.com/step-functions/latest/apireference/API_StartExecution.html">StartExecution</a>: idempotente para STANDARD (name+input).</li>
+  <li><a href="https://docs.powertools.aws.dev/lambda/python/latest/utilities/idempotency/">Lambda Powertools Idempotency</a>: implementación del patrón de idempotency key.</li>
+  <li><a href="https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html">TransactWriteItems</a>: escritura atómica multi-item.</li>
+</ul>
+
+</body>
+</html>
