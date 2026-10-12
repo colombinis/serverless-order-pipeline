@@ -109,14 +109,28 @@ else
   ok "creada"
 fi
 
-# 3. Cola SQS
+# 3. Colas SQS: DLQ + cola principal con redrive
+DLQ="${QUEUE}-dlq"
+info "SQS DLQ ${DLQ}"
+if a sqs get-queue-url --queue-name "$DLQ" >/dev/null 2>&1; then
+  ok "ya existe"
+else
+  a sqs create-queue --queue-name "$DLQ" --attributes MessageRetentionPeriod=1209600 >/dev/null
+  ok "creada"
+fi
+DLQ_ARN="arn:aws:sqs:${REGION}:${ACCOUNT}:${DLQ}"
+
 info "SQS ${QUEUE}"
 if a sqs get-queue-url --queue-name "$QUEUE" >/dev/null 2>&1; then
   ok "ya existe"
 else
-  a sqs create-queue --queue-name "$QUEUE" --attributes VisibilityTimeout=60 >/dev/null
+  a sqs create-queue --queue-name "$QUEUE" >/dev/null
   ok "creada"
 fi
+# Idempotente: aplica visibility + redrive hacia la DLQ
+a sqs set-queue-attributes --queue-url "$QUEUE_URL" \
+  --attributes "{\"VisibilityTimeout\":\"180\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}" >/dev/null
+ok "attributes: VisibilityTimeout=180 + redrive→DLQ (maxReceiveCount=3)"
 
 # 4. Tópico SNS
 info "SNS ${TOPIC}"
@@ -216,15 +230,20 @@ info "Event Source Mapping SQS → ${PREFIX}-processOrder"
 ESM_UUID=$(a lambda list-event-source-mappings --function-name "${PREFIX}-processOrder" \
   --query 'EventSourceMappings[].UUID' --output text 2>/dev/null | tr -d '\n ')
 if [[ "$ESM_UUID" =~ [0-9a-f-]{8} ]]; then
-  ok "ya existe (${ESM_UUID})"
+  if a lambda update-event-source-mapping --uuid "$ESM_UUID" \
+      --batch-size 5 --function-response-types ReportBatchItemFailures >/dev/null 2>&1; then
+    ok "actualizado (${ESM_UUID}): batch-size 5 + ReportBatchItemFailures"
+  else
+    ok "ya existe (${ESM_UUID})"
+  fi
 else
   if a lambda create-event-source-mapping \
       --function-name "${PREFIX}-processOrder" \
       --event-source-arn "arn:aws:sqs:${REGION}:${ACCOUNT}:${QUEUE}" \
-      --batch-size 1 >/dev/null 2>&1; then
-    ok "creado (los mensajes de la cola ahora disparan processOrder)"
+      --batch-size 5 --function-response-types ReportBatchItemFailures >/dev/null 2>&1; then
+    ok "creado (batch-size 5 + ReportBatchItemFailures)"
   else
-    warn "MiniStack no soporta create-event-source-mapping; la cola queda sin consumidor (dríve del SFN por StartExecution manual)"
+    warn "MiniStack no soporta create-event-source-mapping; la cola queda sin consumidor"
   fi
 fi
 

@@ -50,10 +50,24 @@ describe('processOrder handler (idempotent consumer)', () => {
     // Must not throw: the duplicate is a no-op, the batch must not fail forever.
     await expect(
       handler({ Records: [{ body: JSON.stringify({ orderId: 'ord-closed' }) }] })
-    ).resolves.toBeUndefined();
+     ).resolves.toEqual({ batchItemFailures: [] });
 
     // And the next (different) order still starts normally.
     await handler({ Records: [{ body: JSON.stringify({ orderId: 'ord-new' }) }] });
     expect(sfnMock).toHaveReceivedCommandTimes(StartExecutionCommand, 2);
+  });
+
+  it('reports ONLY the bad record as failed (partial batch response)', async () => {
+    sfnMock.on(StartExecutionCommand).resolves({ executionArn: 'arn:exec', startDate: new Date() });
+
+    const result = await handler({
+      Records: [
+        { messageId: 'm1', body: JSON.stringify({ orderId: 'ord-good' }) },
+        { messageId: 'm2', body: 'not-json' },
+      ],
+    });
+
+    expect(result).toEqual({ batchItemFailures: [{ itemIdentifier: 'm2' }] });
+    expect(sfnMock).toHaveReceivedCommandTimes(StartExecutionCommand, 1);
   });
 });

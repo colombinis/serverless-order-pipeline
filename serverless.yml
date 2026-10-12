@@ -72,10 +72,12 @@ functions:
   # 2. SQS consumer: starts the Step Functions execution
   processOrder:
     handler: src/handlers/processOrder.handler
+    timeout: 30
     events:
       - sqs:
           arn: !GetAtt OrderQueue.Arn
-          batchSize: 1
+          batchSize: 5
+          functionResponseType: ReportBatchItemFailures
 
   # 3-7. Individual steps of the state machine (each one is its own Lambda,
   # which is the single-purpose-function pattern)
@@ -160,7 +162,16 @@ resources:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-order-queue-${self:provider.stage}
-        VisibilityTimeout: 60
+        VisibilityTimeout: 180
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+          maxREceiveCount: 3
+    
+    OrdersDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-order-queue-dlq-${self:provider.stage}
+        VisibilityTimeout: 1209600
 
     OrderNotificationsTopic:
       Type: AWS::SNS::Topic
