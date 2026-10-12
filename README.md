@@ -81,8 +81,9 @@ curl http://localhost:4566/health
 
 # 3. Provisiona TODOS los recursos directamente en MiniStack (bootstrap)
 scripts/ministack-bootstrap.sh
-#   Crea: API Gateway REST v1 (POST /orders → createOrder), tabla DynamoDB, cola
-#   SQS, tópico SNS, state machine, 8 Lambdas, event source mapping SQS→processOrder.
+#   Crea: API Gateway REST v1 (POST /orders → createOrder y GET /orders/{orderId} →
+#   getOrder), tabla DynamoDB, cola SQS, tópico SNS, state machine, 9 Lambdas,
+#   event source mapping SQS→processOrder.
 #   Empaqueta el zip con zip nativo. Re-ejecutable (idempotente): actualiza el
 #   código de las Lambdas si ya existen. Al final imprime la URL del endpoint.
 
@@ -173,7 +174,7 @@ para DynamoDB local standalone; con MiniStack el cliente usa
 | **SQS** | Cola `serverless-order-pipeline-order-queue-dev`, mensajes en cola, atributos |
 | **SNS** | Tópico `serverless-order-pipeline-notifications-dev`, suscripciones |
 | **Step Functions** | State machine `OrderFulfillmentStateMachine`, definiciones, ejecuciones |
-| **Lambda** | Las 8 funciones del proyecto, configuración, variables de entorno |
+| **Lambda** | Las 9 funciones del proyecto, configuración, variables de entorno |
 | **CloudWatch Logs** | Logs de cada Lambda invocada |
 | **IAM** | Roles y políticas creadas por las Lambdas |
 
@@ -189,7 +190,7 @@ No requiere configuración adicional.
 
 | Script | Qué hace |
 |--------|----------|
-| `scripts/ministack-bootstrap.sh` | **Provisiona todo en MiniStack**: API Gateway REST v1 (POST /orders → createOrder), tabla DynamoDB, cola SQS, tópico SNS, state machine, 8 Lambdas, event source mapping SQS→processOrder. Empaqueta el zip con `zip` nativo (sin Serverless Framework). Idempotente. Al final imprime la URL del endpoint. |
+| `scripts/ministack-bootstrap.sh` | **Provisiona todo en MiniStack**: API Gateway REST v1 (POST /orders → createOrder y GET /orders/{orderId} → getOrder), tabla DynamoDB, cola SQS, tópico SNS, state machine, 9 Lambdas, event source mapping SQS→processOrder. Empaqueta el zip con `zip` nativo (sin Serverless Framework). Idempotente. Al final imprime la URL del endpoint. |
 | `scripts/local-invoke.js` | **Invocá un handler en proceso** (sin emulador de Lambda), con breakpoints desde VSCode: `node scripts/local-invoke.js createOrder`. Apunta a MiniStack (`:4566`) con las mismas vars del bootstrap. Perfecto para depurar paso a paso cada función. |
 | `scripts/test.sh` | **Ejemplo de API Gateway real sobre MiniStack**: crea una REST API con `GET /saludo/{nombre}`, la enlaza a una Lambda y la invoca por `/_user_request_/`, verificando también los logs en CloudWatch. Útil para entender el control-plane del emulador. |
 | `npm test` | Jest con mocks del AWS SDK (`aws-sdk-client-mock`), sin necesidad de credenciales ni recursos reales. |
@@ -228,23 +229,40 @@ credenciales ni recursos reales desplegados. Genera reporte de cobertura.
 ## Probar el flujo completo (después del bootstrap)
 
 ```bash
-# 1. Crear una orden (HTTP 201, escribe en DynamoDB, encola en SQS).
-#    Usa la URL que imprime el bootstrap (apiId = ID que reporta el script):
-curl -X POST http://localhost:4566/restapis/<apiId>/dev/_user_request_/orders \
+# Base URL (el bootstrap imprime el apiId; forma: .../restapis/<apiId>/dev/_user_request_)
+BASE=http://localhost:4566/restapis/<apiId>/dev/_user_request_
+
+# 1. Crear una orden: HTTP 201 + header Location, escribe en DynamoDB, encola en SQS.
+#    (El contrato vive en openapi.yaml)
+curl -i -X POST "$BASE/orders" \
   -H "Content-Type: application/json" \
   -d '{"customerId": "cust-123", "items": [{"sku": "ABC", "qty": 2}]}'
 
-# 2. Ver el estado final en DynamoDB (usar orderId de la respuesta)
+# 1b. Idempotencia: la MISMA idempotencyKey dos veces → MISMO orderId.
+#     La 2ª responde 201 con "replay": true y NO re-encola.
+curl -X POST "$BASE/orders" -H "Content-Type: application/json" \
+  -d '{"customerId":"cust-123","items":[{"sku":"ABC","qty":2}],"idempotencyKey":"abc-123"}'
+curl -X POST "$BASE/orders" -H "Content-Type: application/json" \
+  -d '{"customerId":"cust-123","items":[{"sku":"ABC","qty":2}],"idempotencyKey":"abc-123"}'
+
+# 1c. Misma key con OTRO body → 422 (application/problem+json, RFC 9457)
+curl -X POST "$BASE/orders" -H "Content-Type: application/json" \
+  -d '{"customerId":"cust-123","items":[{"sku":"ZZZ","qty":9}],"idempotencyKey":"abc-123"}'
+
+# 2. Consultar la orden: HTTP 200 con su estado; 404 (problem+json) si no existe
+curl "$BASE/orders/<orderId>"
+
+# 3. Ver el item en DynamoDB (usar orderId de la respuesta)
 aws --endpoint-url http://localhost:4566 dynamodb get-item \
   --table-name serverless-order-pipeline-orders-dev \
-  --key '{"orderId":{"S":"<orderId-del-paso-1>"}}'
+  --key '{"orderId":{"S":"<orderId>"}}'
 
-# 3. O ver las ejecuciones en Step Functions
+# 4. O ver las ejecuciones en Step Functions
 aws --endpoint-url http://localhost:4566 stepfunctions list-executions \
   --state-machine-arn arn:aws:states:us-east-1:123456789012:stateMachine:OrderFulfillmentStateMachine
 
-# 4. O correr el smoke test del bootstrap (POST real a la API Gateway)
-scripts/ministack-bootstrap.sh SMOKE_TEST=1
+# 5. O correr el smoke test del bootstrap (POST real a la API Gateway)
+SMOKE_TEST=1 scripts/ministack-bootstrap.sh
 
 # Para bajar todo
 docker-compose down
@@ -286,20 +304,18 @@ Para detenerte en el arranque (antes del primer `await`), usá la config con
 
 | Requisito de la JD | Dónde está en este proyecto |
 |---|---|
-| AWS Lambda | Las 8 funciones en `src/handlers/` |
+| AWS Lambda | Las 9 funciones en `src/handlers/` |
 | SQS | `OrderQueue`, consumida por `processOrder` |
 | Step Functions | `OrderFulfillmentStateMachine` en `serverless.yml` |
 | DynamoDB | `OrdersTable`, acceso vía `src/lib/orders.js` |
 | SNS | `OrderNotificationsTopic`, usado en `notifyCustomer` y `cancelOrder` |
-| REST API | API Gateway real de MiniStack: `POST /orders` → `createOrder` (creada por el bootstrap vía CLI, invocada por `/_user_request_/`) |
+| REST API | API Gateway real de MiniStack: `POST /orders` → `createOrder` y `GET /orders/{orderId}` → `getOrder`, con contrato en `openapi.yaml` (201 + `Location`, errores RFC 9457). Creada por el bootstrap vía CLI, invocada por `/_user_request_/` |
 | Testing (unit tests) | `tests/` con Jest + `aws-sdk-client-mock` |
 | CI/CD | `.github/workflows/ci.yml` (deploy a AWS real con Serverless Framework) |
 | OMS / e-commerce | El dominio completo: orden -> stock -> inventario -> pago -> confirmación |
 
 ## Próximos pasos si querés extender el proyecto
 
-- Agregar un endpoint `GET /orders/{orderId}` para consultar estado (misma técnica:
-  `create-resource` + `put-method` + `put-integration` en el bootstrap).
 - Agregar un Dead Letter Queue (DLQ) a `OrderQueue` para mensajes que fallan repetidamente.
 - Agregar retries configurables (`Retry`) en los steps de la state machine además del `Catch`.
 - Probar el flujo con **LocalStack** en vez de MiniStack para comparar limitaciones.
@@ -314,8 +330,8 @@ Framework** (no resuelve `TemplateURL` y no soporta el ciclo de `Lambda::Version
 Por eso `serverless deploy` contra `:4566` no crea la API Gateway *desde el yml*.
 Pero esto **no** significa que MiniStack no pueda emular API Gateway: la emulación
 (REST v1 de 86 ops y HTTP v2 de 42 ops) funciona completa por control-plane, con la
-AWS CLI contra `:4566`. El bootstrap crea la REST API (`POST /orders` → `createOrder`)
-y la publica en el stage `dev`. Todo vive en **un solo servicio** de docker-compose:
+AWS CLI contra `:4566`. El bootstrap crea la REST API (`POST /orders` → `createOrder`
+y `GET /orders/{orderId}` → `getOrder`) y la publica en el stage `dev`. Todo vive en **un solo servicio** de docker-compose:
 
 1. **`ministack` service** (puerto 4566): provee los servicios de data-plane (SQS, SNS, Step Functions, DynamoDB, RDS, Redis) **y API Gateway**. Se accede con `aws --endpoint-url http://localhost:4566`.
 
