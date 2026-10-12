@@ -15,10 +15,12 @@ const sfnClient = new SFNClient({ region: process.env.AWS_REGION || 'us-east-1' 
  *   FAILED) and the message is redelivered, we skip instead of failing forever.
  */
 module.exports.handler = async (event) => {
-  for (const record of event.Records) {
-    const { orderId } = JSON.parse(record.body);
+  const batchItemFailures = [];
 
+  for (const record of event.Records) {
     try {
+      const { orderId } = JSON.parse(record.body);
+
       await sfnClient.send(
         new StartExecutionCommand({
           stateMachineArn: process.env.STATE_MACHINE_ARN,
@@ -27,13 +29,17 @@ module.exports.handler = async (event) => {
         })
       );
     } catch (err) {
-      // A closed execution with the same name+input already fulfilled this order.
-      // The duplicate redelivery must not fail the batch forever.
+      // A closed execution with the same name already fulfilled this order:
+      // it is a no-op, NOT a failure. Do not report it, or SQS would retry forever.
       if (err?.name === 'ExecutionAlreadyExists') {
-        console.log(`Execution already exists for order ${orderId} — skipping duplicate`);
+        console.log(`Execution already exists for order — skipping duplicate`);
         continue;
       }
-      throw err;
+      // Real failure: report ONLY this record so the rest of the batch is not retried.
+      console.error(JSON.stringify({ level: 'error', messageId: record.messageId, error: err.message }));
+      batchItemFailures.push({ itemIdentifier: record.messageId });
     }
   }
+
+  return { batchItemFailures };
 };
