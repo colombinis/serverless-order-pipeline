@@ -37,7 +37,7 @@ TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT}:${TOPIC}"
 STATE_MACHINE_ARN="arn:aws:states:${REGION}:${ACCOUNT}:stateMachine:${STATE_MACHINE}"
 
 ZIP="${ZIP:-$REPO_ROOT/.build/serverless-order-pipeline.zip}"
-LAMBDAS=(createOrder processOrder validateStock reserveInventory chargePayment confirmOrder notifyCustomer cancelOrder)
+LAMBDAS=(createOrder getOrder processOrder validateStock reserveInventory chargePayment confirmOrder notifyCustomer cancelOrder)
 
 a() { aws --endpoint-url "$EP" "$@"; }
 
@@ -50,25 +50,36 @@ warn(){ echo -e "\033[1;33m   ! $*\033[0m"; }
 # quedar bajo src/, y node_modules en la raíz. Así los require('../lib/...') de los
 # handlers resuelven igual que en el repo, y Lambda se configura con el handler
 # "src/handlers/<function>.handler".
-if [[ ! -f "$ZIP" ]]; then
-  info "Empaquetando zip de las 8 Lambdas (sin serverless)"
+# Rebuild when the zip is missing OR any source file is newer than it.
+NEEDS_ZIP=0
+[[ -f "$ZIP" ]] || NEEDS_ZIP=1
+if [[ -f "$ZIP" && -n "$(find src package.json -newer "$ZIP" -print -quit 2>/dev/null)" ]]; then
+  NEEDS_ZIP=1
+fi
+
+if [[ "$NEEDS_ZIP" == "1" ]]; then
+  info "Empaquetando zip de las Lambdas (sin serverless)"
   mkdir -p "$(dirname "$ZIP")"
   TMPDIR="/tmp/lambda-zip"
   rm -rf "$TMPDIR"
-  mkdir -p "$TMPDIR/src/handlers" "$TMPDIR/src/lib"
-  # Copiar handlers y libs preservando la estructura src/handlers + src/lib
+  mkdir -p "$TMPDIR/src/handlers" "$TMPDIR/src/lib" "$TMPDIR/src/domain"
+  # Copiar handlers, libs y dominio preservando la estructura src/
   for name in "${LAMBDAS[@]}"; do
     cp "src/handlers/${name}.js" "$TMPDIR/src/handlers/${name}.js"
   done
   cp src/lib/*.js "$TMPDIR/src/lib/"
+  cp src/domain/*.js "$TMPDIR/src/domain/"
   cp package.json "$TMPDIR/package.json"
   cd "$TMPDIR"
   npm install --production >/dev/null 2>&1
   # Crear zip con src/ y node_modules en la raíz
+  rm -f "$ZIP"
   zip -r9 "$ZIP" src node_modules package.json >/dev/null
   cd "$REPO_ROOT"
   rm -rf "$TMPDIR"
   ok "zip creado en $ZIP"
+else
+  ok "zip al día (sin cambios en src/)"
 fi
 
 # 1. Bucket de deployment (alojamiento del zip para lambda create/update)
@@ -246,7 +257,7 @@ ROOT_ID=$(a apigateway get-resources --rest-api-id "$API_ID" \
   --query 'items[?path==`/`].id' --output text | tr -d '[:space:]')
 ORDERS_ID=$(a apigateway create-resource \
   --rest-api-id "$API_ID" --parent-id "$ROOT_ID" --path-part 'orders' \
-  --query 'id' --output text 2>/dev/null)
+  --query 'id' --output text 2>/dev/null || true)
 if [[ -n "$ORDERS_ID" ]]; then
   ok "resource /orders = ${ORDERS_ID}"
 else
@@ -263,6 +274,30 @@ a apigateway put-integration \
   --http-method POST --type AWS_PROXY --integration-http-method POST \
   --uri "$INTEG_URI" --content-handling CONVERT_TO_TEXT >/dev/null || true
 ok "POST /orders → ${CREATE_ORDER_FN} (AWS_PROXY)"
+
+# GET /orders/{orderId} → getOrder (path parameter, AWS_PROXY)
+GET_ORDER_FN="${PREFIX}-getOrder"
+GET_INTEG_URI="arn:aws:apigateway:${REGION}:lambda:path/2015-03-31/functions/arn:aws:lambda:${REGION}:${ACCOUNT}:function:${GET_ORDER_FN}/invocations"
+ORDER_ID_RES=$(a apigateway create-resource \
+  --rest-api-id "$API_ID" --parent-id "$ORDERS_ID" --path-part '{orderId}' \
+  --query 'id' --output text 2>/dev/null || true)
+if [[ -n "$ORDER_ID_RES" ]]; then
+  ok "resource /orders/{orderId} = ${ORDER_ID_RES}"
+else
+  ORDER_ID_RES=$(a apigateway get-resources --rest-api-id "$API_ID" \
+    --query 'items[?path==`/orders/{orderId}`].id' --output text | tr -d '[:space:]')
+  ok "resource /orders/{orderId} ya existía = ${ORDER_ID_RES}"
+fi
+
+a apigateway put-method \
+  --rest-api-id "$API_ID" --resource-id "$ORDER_ID_RES" \
+  --http-method GET --authorization-type NONE \
+  --request-parameters 'method.request.path.orderId=true' >/dev/null || true
+a apigateway put-integration \
+  --rest-api-id "$API_ID" --resource-id "$ORDER_ID_RES" \
+  --http-method GET --type AWS_PROXY --integration-http-method POST \
+  --uri "$GET_INTEG_URI" --content-handling CONVERT_TO_TEXT >/dev/null || true
+ok "GET /orders/{orderId} → ${GET_ORDER_FN} (AWS_PROXY)"
 
 a apigateway create-deployment --rest-api-id "$API_ID" --stage-name "$STAGE_DEPLOY" >/dev/null 2>&1 || true
 API_URL="${EP}/restapis/${API_ID}/${STAGE_DEPLOY}/_user_request_/orders"
