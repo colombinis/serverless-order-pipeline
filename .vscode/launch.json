@@ -1,0 +1,34 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Invoke Lambda handler (local)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/local-invoke.js",
+      "args": ["${input:handlerName}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"]
+    },
+    {
+      "name": "Invoke Lambda handler (local) — estallido frío",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/local-invoke.js",
+      "args": ["${input:handlerName}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"],
+      "stopOnEntry": true
+    }
+  ],
+  "inputs": [
+    {
+      "id": "handlerName",
+      "type": "promptString",
+      "description": "Nombre del handler (createOrder, processOrder, validateStock, reserveInventory, chargePayment, confirmOrder, notifyCustomer, cancelOrder)",
+      "default": "createOrder"
+    }
+  ]
+}
