@@ -168,11 +168,8 @@ fi
 
 # 5. State Machine (Tasks apuntan a las Lambdas que creamos abajo)
 info "Step Functions ${STATE_MACHINE}"
-if a stepfunctions describe-state-machine --state-machine-arn "$STATE_MACHINE_ARN" >/dev/null 2>&1; then
-  ok "ya existe"
-else
-  ASL="/tmp/ministack-asl.json"
-  cat >"$ASL" <<EOF
+ASL="/tmp/ministack-asl.json"
+cat >"$ASL" <<EOF
 {
   "Comment": "Order fulfillment workflow: stock -> inventory -> payment -> confirm -> notify",
   "StartAt": "ValidateStock",
@@ -180,24 +177,32 @@ else
     "ValidateStock": {
       "Type": "Task",
       "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${PREFIX}-validateStock",
-      "Next": "ReserveInventory",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }]
+      "Retry": [{ "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }],
+      "Next": "ReserveInventory"
     },
     "ReserveInventory": {
       "Type": "Task",
       "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${PREFIX}-reserveInventory",
-      "Next": "ChargePayment",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }]
+      "Retry": [{ "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+      "Catch": [
+        { "ErrorEquals": ["OutOfStock"], "ResultPath": "\$.error", "Next": "CancelOrder" },
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }
+      ],
+      "Next": "ChargePayment"
     },
     "ChargePayment": {
       "Type": "Task",
       "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${PREFIX}-chargePayment",
-      "Next": "ConfirmOrder",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }]
+      "Retry": [{ "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }],
+      "Next": "ConfirmOrder"
     },
     "ConfirmOrder": {
       "Type": "Task",
       "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${PREFIX}-confirmOrder",
+      "Retry": [{ "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }],
       "Next": "NotifyCustomer"
     },
     "NotifyCustomer": {
@@ -213,6 +218,21 @@ else
   }
 }
 EOF
+
+if a stepfunctions describe-state-machine --state-machine-arn "$STATE_MACHINE_ARN" >/dev/null 2>&1; then
+  if a stepfunctions update-state-machine --state-machine-arn "$STATE_MACHINE_ARN" --definition "file://${ASL}" >/dev/null 2>&1; then
+    ok "actualizada (Retry transitorio + Catch OutOfStock)"
+  else
+    warn "update-state-machine no disponible en MiniStack; recreo la máquina"
+    a stepfunctions delete-state-machine --state-machine-arn "$STATE_MACHINE_ARN" >/dev/null 2>&1 || true
+    sleep 1
+    a stepfunctions create-state-machine \
+      --name "$STATE_MACHINE" \
+      --definition "file://${ASL}" \
+      --role-arn "arn:aws:iam::${ACCOUNT}:role/order-fulfillment-${STAGE}" >/dev/null
+    ok "recreada (Retry transitorio + Catch OutOfStock)"
+  fi
+else
   a stepfunctions create-state-machine \
     --name "$STATE_MACHINE" \
     --definition "file://${ASL}" \
