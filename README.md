@@ -226,6 +226,20 @@ npm test
 Corre Jest con mocks del AWS SDK (`aws-sdk-client-mock`), sin necesidad de
 credenciales ni recursos reales desplegados. Genera reporte de cobertura.
 
+## Failure modes tested
+
+Los comportamientos de fallo están cubiertos con pruebas reproducibles, no solo declarados.
+
+| Fallo | Cómo se probó | Resultado esperado |
+| --- | --- | --- |
+| **Mensaje venenoso → DLQ** | Publicar `not-json` en la cola | Tras `maxReceiveCount=3` queda en la DLQ (`queue=0`, `dlq=1`) |
+| **Fallo parcial de lote** | Lote mixto: 4 válidos + 1 inválido | `ReportBatchItemFailures`: los 4 válidos se procesan, solo el inválido va a la DLQ |
+| **Consumidor idempotente** | Re-entregar el mismo mensaje SQS | `ExecutionAlreadyExists` → no-op, no se crea una segunda ejecución |
+| **Sin stock (no overselling)** | 20 órdenes de 1 unidad contra 5 disponibles, en paralelo | 5 `CONFIRMED`, 15 `CANCELLED`, stock final `0` (**nunca negativo**) |
+| **Compensación (saga)** | `Catch` → `CancelOrder`, que libera la reserva | Stock repuesto **una sola vez** (`attribute_not_exists(releasedAt)`) |
+| **Retry de errores transitorios** | `Retry` en el ASL (5 errores `Lambda.*`, backoff 2s→4s→8s) | `OutOfStock` **no** se reintenta; corre 1 vez y va al `Catch` específico |
+| **Transición inválida / replay** | Re-invocar un paso sobre una orden ya `CONFIRMED` | La `ConditionExpression` rechaza el retroceso (no-op) |
+
 ## Probar el flujo completo (después del bootstrap)
 
 ```bash

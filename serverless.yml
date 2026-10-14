@@ -11,7 +11,7 @@
 
 service: serverless-order-pipeline
 
-frameworkVersion: '3'
+frameworkVersion: "3"
 
 plugins:
   - serverless-step-functions
@@ -24,6 +24,8 @@ provider:
   stage: ${opt:stage, 'dev'}
   environment:
     ORDERS_TABLE: ${self:service}-orders-${self:provider.stage}
+    INVENTORY_TABLE: ${self:service}-inventory-${self:provider.stage}
+    RESERVATIONS_TABLE: ${self:service}-reservations-${self:provider.stage}
     # Emulator override: container sets ORDER_QUEUE_URL (MiniStack). Middle-ground
     # default keeps real AWS deploy correct without !Ref (offline resolves the
     # SQS Ref with a placeholder account that MiniStack cannot match).
@@ -38,7 +40,11 @@ provider:
             - dynamodb:PutItem
             - dynamodb:GetItem
             - dynamodb:UpdateItem
-          Resource: !GetAtt OrdersTable.Arn
+            - dynamodb:TransactWriteItems
+          Resource:
+            - !GetAtt OrdersTable.Arn
+            - !GetAtt InventoryTable.Arn
+            - !GetAtt ReservationsTable.Arn
         - Effect: Allow
           Action:
             - sqs:SendMessage
@@ -72,10 +78,12 @@ functions:
   # 2. SQS consumer: starts the Step Functions execution
   processOrder:
     handler: src/handlers/processOrder.handler
+    timeout: 30
     events:
       - sqs:
           arn: !GetAtt OrderQueue.Arn
-          batchSize: 1
+          batchSize: 5
+          functionResponseType: ReportBatchItemFailures
 
   # 3-7. Individual steps of the state machine (each one is its own Lambda,
   # which is the pattern most commonly evaluated in interviews: single-purpose functions)
@@ -108,30 +116,44 @@ stepFunctions:
           ValidateStock:
             Type: Task
             Resource: !GetAtt validateStock.Arn
-            Next: ReserveInventory
-            Catch:
+            Retry: &transientRetry
+              - ErrorEquals:
+                  - Lambda.ClientExecutionTimeoutException
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 2
+                MaxAttempts: 3
+                BackoffRate: 2.0
+            Catch: &catchAll
               - ErrorEquals: ["States.ALL"]
                 ResultPath: "$.error"
                 Next: CancelOrder
+            Next: ReserveInventory
           ReserveInventory:
             Type: Task
             Resource: !GetAtt reserveInventory.Arn
-            Next: ChargePayment
+            Retry: *transientRetry
             Catch:
+              - ErrorEquals: ["OutOfStock"]
+                ResultPath: "$.error"
+                Next: CancelOrder
               - ErrorEquals: ["States.ALL"]
                 ResultPath: "$.error"
                 Next: CancelOrder
+            Next: ChargePayment
           ChargePayment:
             Type: Task
             Resource: !GetAtt chargePayment.Arn
+            Retry: *transientRetry
+            Catch: *catchAll
             Next: ConfirmOrder
-            Catch:
-              - ErrorEquals: ["States.ALL"]
-                ResultPath: "$.error"
-                Next: CancelOrder
           ConfirmOrder:
             Type: Task
             Resource: !GetAtt confirmOrder.Arn
+            Retry: *transientRetry
+            Catch: *catchAll
             Next: NotifyCustomer
           NotifyCustomer:
             Type: Task
@@ -156,11 +178,44 @@ resources:
             KeyType: HASH
         BillingMode: PAY_PER_REQUEST
 
+    InventoryTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-inventory-${self:provider.stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: sku
+            AttributeType: S
+        KeySchema:
+          - AttributeName: sku
+            KeyType: HASH
+
+    ReservationsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-reservations-${self:provider.stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: orderId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: orderId
+            KeyType: HASH
+
     OrderQueue:
       Type: AWS::SQS::Queue
       Properties:
         QueueName: ${self:service}-order-queue-${self:provider.stage}
-        VisibilityTimeout: 60
+        VisibilityTimeout: 180
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+          maxReceiveCount: 3
+
+    OrdersDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-order-queue-dlq-${self:provider.stage}
+        MessageRetentionPeriod: 1209600
 
     OrderNotificationsTopic:
       Type: AWS::SNS::Topic
