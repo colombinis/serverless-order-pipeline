@@ -27,6 +27,8 @@ SERVICE=serverless-order-pipeline
 STAGE=dev
 PREFIX="${SERVICE}-${STAGE}"
 TABLE="${SERVICE}-orders-${STAGE}"
+INVENTORY_TABLE="${SERVICE}-inventory-${STAGE}"
+RESERVATIONS_TABLE="${SERVICE}-reservations-${STAGE}"
 QUEUE="${SERVICE}-order-queue-${STAGE}"
 TOPIC="${SERVICE}-notifications-${STAGE}"
 STATE_MACHINE=OrderFulfillmentStateMachine
@@ -109,14 +111,51 @@ else
   ok "creada"
 fi
 
-# 3. Cola SQS
+# 2b. Tablas de inventario y reservas (Tarea 2)
+for spec in "sku:${INVENTORY_TABLE}" "orderId:${RESERVATIONS_TABLE}"; do
+  KEY="${spec%%:*}"; T="${spec##*:}"
+  info "DynamoDB ${T}"
+  if a dynamodb describe-table --table-name "$T" >/dev/null 2>&1; then
+    ok "ya existe"
+  else
+    a dynamodb create-table --table-name "$T" \
+      --attribute-definitions AttributeName=${KEY},AttributeType=S \
+      --key-schema AttributeName=${KEY},KeyType=HASH \
+      --billing-mode PAY_PER_REQUEST >/dev/null
+    ok "creada"
+  fi
+done
+
+# 2c. Sembrar inventario (re-ejecutable: sobrescribe la disponibilidad)
+info "Inventario inicial"
+a dynamodb put-item --table-name "$INVENTORY_TABLE" \
+  --item '{"sku":{"S":"ABC"},"available":{"N":"1000"}}' >/dev/null
+a dynamodb put-item --table-name "$INVENTORY_TABLE" \
+  --item '{"sku":{"S":"LIMITED"},"available":{"N":"5"}}' >/dev/null
+ok "ABC=1000, LIMITED=5"
+
+# 3. Colas SQS: DLQ + cola principal con redrive
+DLQ="${QUEUE}-dlq"
+info "SQS DLQ ${DLQ}"
+if a sqs get-queue-url --queue-name "$DLQ" >/dev/null 2>&1; then
+  ok "ya existe"
+else
+  a sqs create-queue --queue-name "$DLQ" --attributes MessageRetentionPeriod=1209600 >/dev/null
+  ok "creada"
+fi
+DLQ_ARN="arn:aws:sqs:${REGION}:${ACCOUNT}:${DLQ}"
+
 info "SQS ${QUEUE}"
 if a sqs get-queue-url --queue-name "$QUEUE" >/dev/null 2>&1; then
   ok "ya existe"
 else
-  a sqs create-queue --queue-name "$QUEUE" --attributes VisibilityTimeout=60 >/dev/null
+  a sqs create-queue --queue-name "$QUEUE" >/dev/null
   ok "creada"
 fi
+# Idempotente: aplica visibility + redrive hacia la DLQ
+a sqs set-queue-attributes --queue-url "$QUEUE_URL" \
+  --attributes "{\"VisibilityTimeout\":\"180\",\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"${DLQ_ARN}\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}" >/dev/null
+ok "attributes: VisibilityTimeout=180 + redrive→DLQ (maxReceiveCount=3)"
 
 # 4. Tópico SNS
 info "SNS ${TOPIC}"
@@ -129,11 +168,8 @@ fi
 
 # 5. State Machine (Tasks apuntan a las Lambdas que creamos abajo)
 info "Step Functions ${STATE_MACHINE}"
-if a stepfunctions describe-state-machine --state-machine-arn "$STATE_MACHINE_ARN" >/dev/null 2>&1; then
-  ok "ya existe"
-else
-  ASL="/tmp/ministack-asl.json"
-  cat >"$ASL" <<EOF
+ASL="/tmp/ministack-asl.json"
+cat >"$ASL" <<EOF
 {
   "Comment": "Order fulfillment workflow: stock -> inventory -> payment -> confirm -> notify",
   "StartAt": "ValidateStock",
@@ -141,24 +177,32 @@ else
     "ValidateStock": {
       "Type": "Task",
       "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${PREFIX}-validateStock",
-      "Next": "ReserveInventory",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }]
+      "Retry": [{ "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }],
+      "Next": "ReserveInventory"
     },
     "ReserveInventory": {
       "Type": "Task",
       "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${PREFIX}-reserveInventory",
-      "Next": "ChargePayment",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }]
+      "Retry": [{ "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+      "Catch": [
+        { "ErrorEquals": ["OutOfStock"], "ResultPath": "\$.error", "Next": "CancelOrder" },
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }
+      ],
+      "Next": "ChargePayment"
     },
     "ChargePayment": {
       "Type": "Task",
       "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${PREFIX}-chargePayment",
-      "Next": "ConfirmOrder",
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }]
+      "Retry": [{ "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }],
+      "Next": "ConfirmOrder"
     },
     "ConfirmOrder": {
       "Type": "Task",
       "Resource": "arn:aws:lambda:${REGION}:${ACCOUNT}:function:${PREFIX}-confirmOrder",
+      "Retry": [{ "ErrorEquals": ["Lambda.ClientExecutionTimeoutException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "\$.error", "Next": "CancelOrder" }],
       "Next": "NotifyCustomer"
     },
     "NotifyCustomer": {
@@ -174,6 +218,21 @@ else
   }
 }
 EOF
+
+if a stepfunctions describe-state-machine --state-machine-arn "$STATE_MACHINE_ARN" >/dev/null 2>&1; then
+  if a stepfunctions update-state-machine --state-machine-arn "$STATE_MACHINE_ARN" --definition "file://${ASL}" >/dev/null 2>&1; then
+    ok "actualizada (Retry transitorio + Catch OutOfStock)"
+  else
+    warn "update-state-machine no disponible en MiniStack; recreo la máquina"
+    a stepfunctions delete-state-machine --state-machine-arn "$STATE_MACHINE_ARN" >/dev/null 2>&1 || true
+    sleep 1
+    a stepfunctions create-state-machine \
+      --name "$STATE_MACHINE" \
+      --definition "file://${ASL}" \
+      --role-arn "arn:aws:iam::${ACCOUNT}:role/order-fulfillment-${STAGE}" >/dev/null
+    ok "recreada (Retry transitorio + Catch OutOfStock)"
+  fi
+else
   a stepfunctions create-state-machine \
     --name "$STATE_MACHINE" \
     --definition "file://${ASL}" \
@@ -186,6 +245,8 @@ COMMON_ENV="Variables={
   AWS_ENDPOINT_URL=http://ministack:4566,
   AWS_REGION=${REGION},
   ORDERS_TABLE=${TABLE},
+  INVENTORY_TABLE=${INVENTORY_TABLE},
+  RESERVATIONS_TABLE=${RESERVATIONS_TABLE},
   ORDER_QUEUE_URL=${QUEUE_URL},
   NOTIFICATIONS_TOPIC_ARN=${TOPIC_ARN},
   STATE_MACHINE_ARN=${STATE_MACHINE_ARN}
@@ -216,15 +277,20 @@ info "Event Source Mapping SQS → ${PREFIX}-processOrder"
 ESM_UUID=$(a lambda list-event-source-mappings --function-name "${PREFIX}-processOrder" \
   --query 'EventSourceMappings[].UUID' --output text 2>/dev/null | tr -d '\n ')
 if [[ "$ESM_UUID" =~ [0-9a-f-]{8} ]]; then
-  ok "ya existe (${ESM_UUID})"
+  if a lambda update-event-source-mapping --uuid "$ESM_UUID" \
+      --batch-size 5 --function-response-types ReportBatchItemFailures >/dev/null 2>&1; then
+    ok "actualizado (${ESM_UUID}): batch-size 5 + ReportBatchItemFailures"
+  else
+    ok "ya existe (${ESM_UUID})"
+  fi
 else
   if a lambda create-event-source-mapping \
       --function-name "${PREFIX}-processOrder" \
       --event-source-arn "arn:aws:sqs:${REGION}:${ACCOUNT}:${QUEUE}" \
-      --batch-size 1 >/dev/null 2>&1; then
-    ok "creado (los mensajes de la cola ahora disparan processOrder)"
+      --batch-size 5 --function-response-types ReportBatchItemFailures >/dev/null 2>&1; then
+    ok "creado (batch-size 5 + ReportBatchItemFailures)"
   else
-    warn "MiniStack no soporta create-event-source-mapping; la cola queda sin consumidor (dríve del SFN por StartExecution manual)"
+    warn "MiniStack no soporta create-event-source-mapping; la cola queda sin consumidor"
   fi
 fi
 
