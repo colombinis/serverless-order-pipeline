@@ -36,4 +36,35 @@ describe('updateOrderStatus guards', () => {
       ConditionExpression: '#status <> :status',
     });
   });
+  // --- 4E: branch gaps ---
+
+  it('accepts an explicit expected list and builds an IN clause', async () => {
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await updateOrderStatus('o1', 'PENDING', {}, { expected: ['PENDING', 'STOCK_VALIDATED'] });
+
+    expect(ddbMock).toHaveReceivedCommandWith(UpdateCommand, {
+      ConditionExpression: '#status IN (:from0, :from1)',
+      ExpressionAttributeValues: expect.objectContaining({
+        ':from0': 'PENDING',
+        ':from1': 'STOCK_VALIDATED',
+      }),
+    });
+  });
+
+  it('omits the condition when the target status has no guard', async () => {
+    ddbMock.on(UpdateCommand).resolves({});
+
+    await updateOrderStatus('o1', 'SOMETHING_ELSE');
+
+    const input = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(input.ConditionExpression).toBeUndefined();
+  });
+
+  it('rethrows unexpected DynamoDB errors', async () => {
+    ddbMock.on(UpdateCommand).rejects(new Error('boom'));
+
+    await expect(updateOrderStatus('o1', 'CONFIRMED')).rejects.toThrow('boom');
+  });
+
 });
