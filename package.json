@@ -26,6 +26,8 @@
     "jest": "^29.7.0"
   },
   "jest": {
-    "setupFiles": ["<rootDir>/jest.setup.js"]
+    "testEnvironment": "node",
+    "setupFiles": ["<rootDir>/jest.setup.js"],
+    "collectCoverageFrom": ["src/**/*.js"]
   }
 }
