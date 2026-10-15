@@ -22,10 +22,16 @@ provider:
   runtime: nodejs18.x
   region: us-east-1
   stage: ${opt:stage, 'dev'}
+  tracing:
+    lambda: true
+    apiGateway: true
+  logRetentionInDays: 14
   environment:
     ORDERS_TABLE: ${self:service}-orders-${self:provider.stage}
     INVENTORY_TABLE: ${self:service}-inventory-${self:provider.stage}
     RESERVATIONS_TABLE: ${self:service}-reservations-${self:provider.stage}
+    POWERTOOLS_SERVICE_NAME: order-pipeline
+    POWERTOOLS_METRICS_NAMESPACE: OrderPipeline
     # Emulator override: container sets ORDER_QUEUE_URL (MiniStack). Middle-ground
     # default keeps real AWS deploy correct without !Ref (offline resolves the
     # SQS Ref with a placeholder account that MiniStack cannot match).
@@ -108,7 +114,10 @@ functions:
 stepFunctions:
   stateMachines:
     orderFulfillment:
+      id: OrderStateMachine
       name: OrderFulfillmentStateMachine
+      tracingConfig:
+        enabled: true
       definition:
         Comment: "Order fulfillment workflow: stock -> inventory -> payment -> confirm -> notify"
         StartAt: ValidateStock
@@ -222,6 +231,67 @@ resources:
       Properties:
         TopicName: ${self:service}-notifications-${self:provider.stage}
 
+    AlarmTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-alarms-${self:provider.stage}
+        Subscription:
+          - Protocol: email
+            Endpoint: ${env:ALARM_EMAIL, 'alerts@example.com'}
+
+    DlqNotEmptyAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${self:provider.stage}-dlq-not-empty
+        AlarmDescription: Messages are stuck in the orders DLQ
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt OrdersDLQ.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: [!Ref AlarmTopic]
+
+    CreateOrderErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${self:provider.stage}-create-order-errors
+        AlarmDescription: createOrder is failing
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions:
+          - Name: FunctionName
+            Value: ${self:service}-${self:provider.stage}-createOrder
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: [!Ref AlarmTopic]
+
+    WorkflowFailedAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${self:provider.stage}-workflow-failed
+        AlarmDescription: Order workflow executions are failing
+        Namespace: AWS/States
+        MetricName: ExecutionsFailed
+        Dimensions:
+          - Name: StateMachineArn
+            Value: !Ref OrderStateMachine
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        AlarmActions: [!Ref AlarmTopic]
 custom:
   # En local no se usa este archivo: `scripts/ministack-bootstrap.sh` provisiona
   # todo directo contra MiniStack (:4566), incluida una API Gateway REST v1 real

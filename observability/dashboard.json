@@ -1,0 +1,79 @@
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "x": 0, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "title": "createOrder latency (p50 / p95 / p99)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "period": 60,
+        "metrics": [
+          [ "AWS/Lambda", "Duration", "FunctionName", "serverless-order-pipeline-dev-createOrder", { "stat": "p50", "label": "p50" } ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "serverless-order-pipeline-dev-createOrder", { "stat": "p95", "label": "p95" } ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "serverless-order-pipeline-dev-createOrder", { "stat": "p99", "label": "p99" } ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 0, "width": 12, "height": 6,
+      "properties": {
+        "title": "Lambda errors and throttles (all functions)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "period": 300,
+        "metrics": [
+          [ { "expression": "SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Errors\"', 'Sum', 300)", "id": "errors", "label": "Errors" } ],
+          [ { "expression": "SEARCH('{AWS/Lambda,FunctionName} MetricName=\"Throttles\"', 'Sum', 300)", "id": "throttles", "label": "Throttles" } ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0, "y": 6, "width": 12, "height": 6,
+      "properties": {
+        "title": "Orders queue depth vs DLQ",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "stat": "Maximum",
+        "period": 60,
+        "metrics": [
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "serverless-order-pipeline-order-queue-dev", { "label": "main queue" } ],
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "serverless-order-pipeline-order-queue-dlq-dev", { "label": "DLQ" } ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 6, "width": 12, "height": 6,
+      "properties": {
+        "title": "Workflow executions (Step Functions)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "period": 300,
+        "metrics": [
+          [ { "expression": "SEARCH('{AWS/States,StateMachineArn} MetricName=\"ExecutionsStarted\"', 'Sum', 300)", "id": "started", "label": "Started" } ],
+          [ { "expression": "SEARCH('{AWS/States,StateMachineArn} MetricName=\"ExecutionsSucceeded\"', 'Sum', 300)", "id": "succeeded", "label": "Succeeded" } ],
+          [ { "expression": "SEARCH('{AWS/States,StateMachineArn} MetricName=\"ExecutionsFailed\"', 'Sum', 300)", "id": "failed", "label": "Failed" } ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0, "y": 12, "width": 24, "height": 6,
+      "properties": {
+        "title": "Business metrics (EMF via Powertools)",
+        "region": "us-east-1",
+        "view": "timeSeries",
+        "period": 60,
+        "metrics": [
+          [ "OrderPipeline", "OrderAccepted", "service", "order-pipeline", { "stat": "Sum" } ],
+          [ "OrderPipeline", "OrderConfirmed", "service", "order-pipeline", { "stat": "Sum" } ],
+          [ "OrderPipeline", "OrderCancelled", "service", "order-pipeline", { "stat": "Sum" } ],
+          [ "OrderPipeline", "OutOfStock", "service", "order-pipeline", { "stat": "Sum" } ]
+        ]
+      }
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 const { SFNClient, StartExecutionCommand } = require('@aws-sdk/client-sfn');
-
+const { logger, tracer } = require('../lib/observability');
 const sfnClient = new SFNClient({ region: process.env.AWS_REGION || 'us-east-1' });
+tracer.captureAWSv3Client(sfnClient);
 
 /**
  * SQS-triggered handler.
@@ -18,8 +19,9 @@ module.exports.handler = async (event) => {
   const batchItemFailures = [];
 
   for (const record of event.Records) {
+    let orderId;
     try {
-      const { orderId } = JSON.parse(record.body);
+      ({ orderId } = JSON.parse(record.body));
 
       await sfnClient.send(
         new StartExecutionCommand({
@@ -28,15 +30,16 @@ module.exports.handler = async (event) => {
           input: JSON.stringify({ orderId }),
         })
       );
+      logger.info('Workflow started', { orderId });
     } catch (err) {
       // A closed execution with the same name already fulfilled this order:
       // it is a no-op, NOT a failure. Do not report it, or SQS would retry forever.
       if (err?.name === 'ExecutionAlreadyExists') {
-        console.log(`Execution already exists for order — skipping duplicate`);
+        logger.info('Duplicate event skipped (execution already exists)', { orderId });
         continue;
       }
       // Real failure: report ONLY this record so the rest of the batch is not retried.
-      console.error(JSON.stringify({ level: 'error', messageId: record.messageId, error: err.message }));
+      logger.error('Failed to start workflow', { messageId: record.messageId, error: err.message });
       batchItemFailures.push({ itemIdentifier: record.messageId });
     }
   }

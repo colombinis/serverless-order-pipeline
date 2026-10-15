@@ -1,8 +1,9 @@
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 const { getOrder } = require('../lib/orders');
+const { tracer } = require('../lib/observability');
 
 const snsClient = new SNSClient({ region: process.env.AWS_REGION || 'us-east-1' });
-
+tracer.captureAWSv3Client(snsClient);
 /**
  * Step Functions Task. Input: { orderId }
  * Final success step: publishes a confirmation notification.
