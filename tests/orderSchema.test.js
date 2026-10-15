@@ -68,6 +68,22 @@ describe('validateCreateOrder', () => {
     });
   });
 
+  it('rejects more than 50 items', () => {
+    const items = Array.from({ length: 51 }, (_, i) => ({ sku: `SKU-${i}`, qty: 1 }));
+    const result = validateCreateOrder({ customerId: 'c', items });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain('items: must have at most 50 items');
+  });
+
+  it('accepts exactly 50 items', () => {
+    const items = Array.from({ length: 50 }, (_, i) => ({ sku: `SKU-${i}`, qty: 1 }));
+    const result = validateCreateOrder({ customerId: 'c', items });
+
+    expect(result.ok).toBe(true);
+    expect(result.value.items).toHaveLength(50);
+  });
+
   it.each([
     ['a string', 'nope'],
     ['null', null],
