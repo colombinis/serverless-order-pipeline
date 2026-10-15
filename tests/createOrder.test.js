@@ -6,6 +6,7 @@ const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const ddbMock = mockClient(DynamoDBDocumentClient);
 const sqsMock = mockClient(SQSClient);
 
+delete process.env.AWS_REGION; // deterministic: exercises the region fallback
 process.env.ORDERS_TABLE = 'test-orders-table';
 process.env.ORDER_QUEUE_URL = 'https://sqs.fake/queue';
 
@@ -193,4 +194,35 @@ describe('createOrder handler', () => {
       ConditionExpression: 'attribute_not_exists(orderId)',
     });
   });
+  // --- 4E: branch gaps ---
+
+  it('treats a missing body as an empty object', async () => {
+    const result = await handler({});
+
+    expect(result.statusCode).toBe(422);
+    expect(JSON.parse(result.body).detail).toMatch(/items/);
+  });
+
+  it('rethrows unexpected DynamoDB errors from the create', async () => {
+    ddbMock.on(PutCommand).rejects(new Error('boom'));
+
+    await expect(
+      handler({ body: JSON.stringify({ customerId: 'c', items: [{ sku: 'A', qty: 1 }] }) })
+    ).rejects.toThrow('boom');
+    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+  });
+
+  it('rethrows when the guard rejects but the order cannot be read back', async () => {
+    ddbMock
+      .on(PutCommand)
+      .rejects(Object.assign(new Error('guard rejected'), { name: 'ConditionalCheckFailedException' }));
+    ddbMock.on(GetCommand).resolves({ Item: undefined });
+
+    await expect(
+      handler({
+        body: JSON.stringify({ customerId: 'c', items: [{ sku: 'A', qty: 1 }], idempotencyKey: 'k' }),
+      })
+    ).rejects.toThrow('guard rejected');
+  });
+
 });

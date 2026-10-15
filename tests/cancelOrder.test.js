@@ -11,6 +11,7 @@ const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 const ddbMock = mockClient(DynamoDBDocumentClient);
 const snsMock = mockClient(SNSClient);
 
+delete process.env.AWS_REGION; // deterministic: exercises the region fallback
 process.env.ORDERS_TABLE = 'test-orders-table';
 process.env.INVENTORY_TABLE = 'test-inventory-table';
 process.env.RESERVATIONS_TABLE = 'test-reservations-table';
@@ -94,4 +95,36 @@ describe('cancelOrder handler', () => {
       ExpressionAttributeValues: expect.objectContaining({ ':status': 'CANCELLED' }),
     });
   });
+  // --- 4E: branch gaps ---
+
+  it('releases nothing extra when the reservation has no items', async () => {
+    ddbMock.on(GetCommand).resolves({ Item: { orderId: 'o1' } });
+
+    const result = await handler({ orderId: 'o1' });
+
+    expect(result).toEqual({ orderId: 'o1', status: 'CANCELLED' });
+    // Only the "released" marker is written: there is nothing to add back.
+    const items = ddbMock.commandCalls(TransactWriteCommand)[0].args[0].input.TransactItems;
+    expect(items).toHaveLength(1);
+  });
+
+  it('rethrows a cancellation whose reasons cannot be read', async () => {
+    ddbMock.on(GetCommand).resolves({ Item: { orderId: 'o1', items: [{ sku: 'A', qty: 1 }] } });
+    // TransactionCanceledException with no CancellationReasons field.
+    ddbMock
+      .on(TransactWriteCommand)
+      .rejects(Object.assign(new Error('cancelled'), { name: 'TransactionCanceledException' }));
+
+    await expect(handler({ orderId: 'o1' })).rejects.toMatchObject({
+      name: 'TransactionCanceledException',
+    });
+  });
+
+  it('rethrows unexpected transaction errors', async () => {
+    ddbMock.on(GetCommand).resolves({ Item: { orderId: 'o1', items: [{ sku: 'A', qty: 1 }] } });
+    ddbMock.on(TransactWriteCommand).rejects(new Error('boom'));
+
+    await expect(handler({ orderId: 'o1' })).rejects.toThrow('boom');
+  });
+
 });
