@@ -1,5 +1,7 @@
 # serverless-order-pipeline
 
+![CI/CD](https://github.com/colombinis/serverless-order-pipeline/actions/workflows/ci.yml/badge.svg)
+
 Pipeline de fulfillment de órdenes en AWS, pensado como proyecto
 para cubrir los "requisitos" de una proyecto orientada a OMS de e-commerce +
 AWS serverless (Lambda, Step Functions, DynamoDB, SQS/SNS).
