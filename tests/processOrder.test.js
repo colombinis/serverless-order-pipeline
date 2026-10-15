@@ -5,7 +5,9 @@ const { SFNClient, StartExecutionCommand } = require('@aws-sdk/client-sfn');
 const sfnMock = mockClient(SFNClient);
 
 process.env.STATE_MACHINE_ARN = 'arn:aws:states:us-east-1:123456789012:stateMachine:OrderFulfillment';
-process.env.AWS_REGION = 'us-east-1';
+// Deterministic: unset it so the module-level `|| 'us-east-1'` fallback
+// is evaluated (the handler does not need AWS_REGION to be set).
+delete process.env.AWS_REGION;
 
 const { handler } = require('../src/handlers/processOrder');
 
