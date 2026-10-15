@@ -301,6 +301,25 @@ Las cuatro consultas listas para pegar en **Logs Insights** están en
 [`observability/queries.md`](observability/queries.md): errores recientes, latencia p95 por
 ventana, cold starts y la traza completa de una orden puntual (caso de soporte).
 
+### Evidencia en local: el log real de una orden
+
+El emulador **sí** guarda los logs de Lambda. Se leen con `filter-log-events` (no aparecen en
+`docker compose logs`, y el log group existe recién después de la primera invocación):
+
+```bash
+aws --endpoint-url http://localhost:4566 logs filter-log-events \
+  --log-group-name /aws/lambda/serverless-order-pipeline-dev-createOrder \
+  --limit 5 --query 'events[].message' --output text
+```
+
+De una invocación real (no de un test) sale el log estructurado y su línea EMF — cada una es una
+sola línea en la salida real:
+
+```json
+{"level":"INFO","message":"Order accepted","timestamp":"2026-10-15T16:21:03.143Z","service":"order-pipeline","sampling_rate":0,"orderId":"3a45c919-cb45-4d98-9b9f-3cbbc93b0ce7","customerId":"mini","itemCount":1}
+{"_aws":{"Timestamp":1792081263147,"CloudWatchMetrics":[{"Namespace":"OrderPipeline","Dimensions":[["service"]],"Metrics":[{"Name":"OrderAccepted","Unit":"Count"}]}]},"service":"order-pipeline","OrderAccepted":1}
+```
+
 ### Falla provocada: mensaje venenoso → DLQ
 
 No alcanza con declarar la DLQ: acá se **provocó la falla**. Se envía a la cola un mensaje que
@@ -340,17 +359,20 @@ en `180`.
 
 ### Limitaciones del entorno local (MiniStack)
 
-El emulador no replica la observabilidad completa, así que hay que ser explícito sobre qué se
-verifica localmente y qué requiere AWS real:
+El emulador no replica la observabilidad completa, así que conviene ser explícito sobre qué se
+verifica en local y qué requiere AWS real:
 
-- **Sin daemon X-Ray**: las trazas se instrumentan pero no se visualizan en local.
-- **Sin log groups de Lambda**: `filter-log-events` responde `ResourceNotFoundException`; los
-  logs se ven en `docker compose logs -f ministack` o en AWS real.
-- **Las alarmas no se evalúan**: nadie publica métricas en el emulador, así que no cambian de
-  estado. Que disparen un email requiere AWS real.
-- **Lo que sí se verifica local**: que el dashboard y las alarmas sean válidos
-  (`put-dashboard` → sin mensajes de error; `describe-alarms` → las lista) y que la falla de la
-  DLQ ocurra de verdad (el taladro de arriba, reproducible).
+- **Sin daemon X-Ray**: las trazas se instrumentan (los subsegmentos se generan) pero no hay
+  dónde visualizarlas.
+- **Las métricas no se ingestan**: las líneas EMF salen como texto en los logs, pero
+  `cloudwatch list-metrics` queda **vacío** → las alarmas no se evalúan (no cambian de estado) y
+  un dashboard local se ve **sin datos**. Que una alarma llegue a mandar un email requiere AWS real.
+- **Sin retención aplicada**: `logRetentionInDays: 14` lo aplica el `serverless deploy`; en local
+  los log groups quedan sin `retentionInDays`.
+- **Lo que sí se verifica en local**: los logs estructurados **reales** de cada invocación
+  (`filter-log-events`, ver arriba), que el dashboard y las alarmas sean definiciones válidas
+  (`put-dashboard` sin mensajes de error y `describe-alarms` las lista) y que la falla de la DLQ
+  ocurra de verdad (el taladro de abajo, reproducible).
 
 ## Probar el flujo completo (después del bootstrap)
 
