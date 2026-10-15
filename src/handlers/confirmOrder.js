@@ -1,4 +1,5 @@
 const { updateOrderStatus } = require('../lib/orders');
+const { logger, metrics, MetricUnit } = require('../lib/observability');
 
 /**
  * Step Functions Task. Input: { orderId }
@@ -7,5 +8,8 @@ const { updateOrderStatus } = require('../lib/orders');
  */
 module.exports.handler = async ({ orderId }) => {
   await updateOrderStatus(orderId, 'CONFIRMED');
+  logger.info('Order confirmed', { orderId });
+  metrics.addMetric('OrderConfirmed', MetricUnit.Count, 1);
+  metrics.publishStoredMetrics();
   return { orderId };
 };
