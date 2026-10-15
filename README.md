@@ -240,6 +240,118 @@ Los comportamientos de fallo están cubiertos con pruebas reproducibles, no solo
 | **Retry de errores transitorios** | `Retry` en el ASL (5 errores `Lambda.*`, backoff 2s→4s→8s) | `OutOfStock` **no** se reintenta; corre 1 vez y va al `Catch` específico |
 | **Transición inválida / replay** | Re-invocar un paso sobre una orden ya `CONFIRMED` | La `ConditionExpression` rechaza el retroceso (no-op) |
 
+## Observability
+
+Instrumentado con **Powertools for AWS Lambda** (Logger, Metrics, Tracer): logs en
+JSON, métricas de negocio por EMF y trazas X-Ray, todo declarado en `serverless.yml`.
+
+### Qué hay, dónde vive y qué se ve
+
+| Pieza | Dónde vive | Qué se ve |
+| --- | --- | --- |
+| **Logs estructurados** | `src/lib/observability.js` (`logger`) | CloudWatch Logs, retención **14 días**. JSON con `level`, `message`, `orderId`, `cold_start` |
+| **Métricas de negocio (EMF)** | `metrics` en `src/lib/observability.js` | Namespace `OrderPipeline`: `OrderAccepted`, `OrderConfirmed`, `OrderCancelled`, `OutOfStock` |
+| **Métricas técnicas** | Lambda / API Gateway / SQS / Step Functions | `Errors`, `Throttles`, latencia, profundidad de cola, ejecuciones |
+| **Trazas** | `tracer` + `captureAWSv3Client` (DynamoDB, SQS, SFN, SNS) | X-Ray: mapa de servicios y subsegmentos por llamada AWS |
+| **Alarmas** | `serverless.yml` (`AlarmTopic` + 3 alarmas) | CloudWatch Alarms; notifican por email (ver abajo) |
+| **Dashboard** | `observability/dashboard.json` | CloudWatch Dashboards → `OrderPipeline` (5 widgets) |
+| **Consultas** | `observability/queries.md` | CloudWatch Logs Insights: errores, latencia p95, cold starts, orden puntual |
+
+Configuración relevante en `serverless.yml`: `provider.tracing` (Lambda + API Gateway),
+`logRetentionInDays: 14`, `tracingConfig: { enabled: true }` en la state machine y las
+variables `POWERTOOLS_SERVICE_NAME`, `POWERTOOLS_LOG_LEVEL`,
+`POWERTOOLS_METRICS_NAMESPACE` y `POWERTOOLS_TRACE_ENABLED`.
+
+### Alarmas
+
+| Alarma | Dispara cuando |
+| --- | --- |
+| `DlqNotEmptyAlarm` | hay al menos 1 mensaje en la DLQ (`ApproximateNumberOfMessages > 0`) |
+| `CreateOrderErrorsAlarm` | `createOrder` acumula errores en la ventana |
+| `WorkflowFailedAlarm` | Step Functions registra ejecuciones fallidas |
+
+Las tres publican en el tópico SNS `AlarmTopic`. El email de destino **no está hardcodeado**
+(este repo es público): se toma de la variable `ALARM_EMAIL` al desplegar.
+
+```bash
+ALARM_EMAIL=tu-email@dominio.com npm exec serverless -- deploy
+```
+
+```bash
+# Ver las alarmas creadas
+aws cloudwatch describe-alarms --query 'MetricAlarms[].AlarmName' --output text
+```
+
+### Dashboard
+
+Se versiona como código y se aplica por API (así el panel es reproducible y revisable en el PR):
+
+```bash
+aws cloudwatch put-dashboard --dashboard-name OrderPipeline \
+  --dashboard-body file://observability/dashboard.json
+
+# Verificar
+aws cloudwatch get-dashboard --dashboard-name OrderPipeline \
+  --query DashboardBody --output text | python3 -m json.tool
+```
+
+### Consultas de logs
+
+Las cuatro consultas listas para pegar en **Logs Insights** están en
+[`observability/queries.md`](observability/queries.md): errores recientes, latencia p95 por
+ventana, cold starts y la traza completa de una orden puntual (caso de soporte).
+
+### Falla provocada: mensaje venenoso → DLQ
+
+No alcanza con declarar la DLQ: acá se **provocó la falla**. Se envía a la cola un mensaje que
+`processOrder` no puede parsear (`not-json`); el consumidor lo reporta vía
+`ReportBatchItemFailures` y, tras `maxReceiveCount=3`, SQS lo mueve a la DLQ.
+
+```bash
+export AWS_ACCESS_KEY_ID=123456789012 AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
+EP=http://localhost:4566
+Q=$(aws --endpoint-url $EP sqs get-queue-url \
+      --queue-name serverless-order-pipeline-order-queue-dev --query QueueUrl --output text)
+D=$(aws --endpoint-url $EP sqs get-queue-url \
+      --queue-name serverless-order-pipeline-order-queue-dev-dlq --query QueueUrl --output text)
+
+# Acelerar el redrive SOLO para la prueba (y restaurar después)
+aws --endpoint-url $EP sqs set-queue-attributes --queue-url "$Q" \
+  --attributes '{"VisibilityTimeout":"5"}'
+
+aws --endpoint-url $EP sqs send-message --queue-url "$Q" --message-body 'not-json'
+
+sleep 30   # 3 reintentos + redrive
+
+aws --endpoint-url $EP sqs get-queue-attributes --queue-url "$D" \
+  --attribute-names ApproximateNumberOfMessages --output text   # → 1
+
+# El cuerpo original se preserva intacto para diagnosticar
+aws --endpoint-url $EP sqs receive-message --queue-url "$D" \
+  --query 'Messages[0].Body' --output text                      # → not-json
+
+# Restaurar el valor real
+aws --endpoint-url $EP sqs set-queue-attributes --queue-url "$Q" \
+  --attributes '{"VisibilityTimeout":"180"}'
+```
+
+Resultado observado: DLQ `0 → 1`, cuerpo `not-json` preservado, `VisibilityTimeout` de vuelta
+en `180`.
+
+### Limitaciones del entorno local (MiniStack)
+
+El emulador no replica la observabilidad completa, así que hay que ser explícito sobre qué se
+verifica localmente y qué requiere AWS real:
+
+- **Sin daemon X-Ray**: las trazas se instrumentan pero no se visualizan en local.
+- **Sin log groups de Lambda**: `filter-log-events` responde `ResourceNotFoundException`; los
+  logs se ven en `docker compose logs -f ministack` o en AWS real.
+- **Las alarmas no se evalúan**: nadie publica métricas en el emulador, así que no cambian de
+  estado. Que disparen un email requiere AWS real.
+- **Lo que sí se verifica local**: que el dashboard y las alarmas sean válidos
+  (`put-dashboard` → sin mensajes de error; `describe-alarms` → las lista) y que la falla de la
+  DLQ ocurra de verdad (el taladro de arriba, reproducible).
+
 ## Probar el flujo completo (después del bootstrap)
 
 ```bash
