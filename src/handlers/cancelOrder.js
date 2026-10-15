@@ -2,8 +2,10 @@ const { TransactWriteCommand, GetCommand } = require('@aws-sdk/lib-dynamodb');
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 const { docClient } = require('../lib/dynamo');
 const { updateOrderStatus } = require('../lib/orders');
+const { logger, metrics,tracer, MetricUnit } = require('../lib/observability');
 
 const snsClient = new SNSClient({ region: process.env.AWS_REGION || 'us-east-1' });
+tracer.captureAWSv3Client(snsClient);
 const INVENTORY_TABLE = process.env.INVENTORY_TABLE;
 const RESERVATIONS_TABLE = process.env.RESERVATIONS_TABLE;
 
@@ -62,11 +64,15 @@ async function releaseReservation(orderId) {
  * the state machine's ResultPath.
  */
 module.exports.handler = async ({ orderId, error }) => {
+  const cancelReason = error?.Cause || 'Unknown error';
+
   await releaseReservation(orderId);
 
-  await updateOrderStatus(orderId, 'CANCELLED', {
-    cancelReason: error?.Cause || 'Unknown error',
-  });
+  await updateOrderStatus(orderId, 'CANCELLED', { cancelReason });
+
+  logger.warn('Order cancelled', { orderId, cancelReason });
+  metrics.addMetric('OrderCancelled', MetricUnit.Count, 1);
+  metrics.publishStoredMetrics();
 
   await snsClient.send(
     new PublishCommand({

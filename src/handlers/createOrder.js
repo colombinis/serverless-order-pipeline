@@ -5,9 +5,11 @@ const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { docClient } = require('../lib/dynamo');
 const { response, problem } = require('../lib/response');
 const { validateCreateOrder } = require('../domain/orderSchema');
+const { logger, metrics,tracer, MetricUnit } = require('../lib/observability');
+
 
 const sqsClient = new SQSClient({ region: process.env.AWS_REGION || 'us-east-1' });
-
+tracer.captureAWSv3Client(sqsClient);
 /**
  * POST /orders
  * body: { "customerId": "cust-123", "items": [{ "sku": "ABC", "qty": 2 }], "idempotencyKey": "abc-123" }
@@ -52,6 +54,7 @@ module.exports.handler = async (event) => {
 
   const parsed = validateCreateOrder(payload);
   if (!parsed.ok) {
+    logger.warn('Order rejected: invalid payload', { errors: parsed.errors });
     return problem(422, 'Invalid order', parsed.errors.join('; '));
   }
 
@@ -99,6 +102,7 @@ module.exports.handler = async (event) => {
             'This idempotencyKey was already used with a different request body.'
           );
         }
+        logger.info('Order replay', { orderId: existing.Item.orderId });
         return response(
           201,
           { orderId: existing.Item.orderId, status: existing.Item.status, replay: true },
@@ -116,5 +120,8 @@ module.exports.handler = async (event) => {
     })
   );
 
+  logger.info('Order accepted', { orderId, customerId, itemCount: items.length });
+  metrics.addMetric('OrderAccepted', MetricUnit.Count, 1);
+  metrics.publishStoredMetrics();
   return response(201, { orderId, status: order.status }, locationOf(orderId));
 };

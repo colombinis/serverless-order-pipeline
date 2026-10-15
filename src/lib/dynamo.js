@@ -1,6 +1,6 @@
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
-
+const { tracer } = require('./observability');
 // Reused across warm Lambda invocations - avoid creating a new client per call
 const client = new DynamoDBClient({
   region: process.env.AWS_REGION || 'us-east-1',
@@ -13,6 +13,6 @@ const client = new DynamoDBClient({
     (process.env.IS_OFFLINE ? 'http://localhost:8000' : undefined),
 });
 
-const docClient = DynamoDBDocumentClient.from(client);
+const docClient = DynamoDBDocumentClient.from(tracer.captureAWSv3Client(client));
 
 module.exports = { docClient };

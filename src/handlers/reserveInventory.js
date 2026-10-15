@@ -1,6 +1,7 @@
 const { TransactWriteCommand } = require('@aws-sdk/lib-dynamodb');
 const { docClient } = require('../lib/dynamo');
 const { getOrder, updateOrderStatus } = require('../lib/orders');
+const { logger, metrics, MetricUnit } = require('../lib/observability');
 
 const INVENTORY_TABLE = process.env.INVENTORY_TABLE;
 const RESERVATIONS_TABLE = process.env.RESERVATIONS_TABLE;
@@ -61,9 +62,13 @@ module.exports.handler = async ({ orderId }) => {
       const stockShort = reasons.slice(1).some((r) => r?.Code === 'ConditionalCheckFailed');
 
       if (alreadyReserved) {
+        logger.info('Inventory already reserved (replay)', { orderId });
         return { orderId, alreadyReserved: true };
       }
       if (stockShort) {
+        logger.warn('Out of stock', { orderId });
+        metrics.addMetric('OutOfStock', MetricUnit.Count, 1);
+        metrics.publishStoredMetrics();
         const e = new Error(`Insufficient stock for order ${orderId}`);
         e.name = 'OutOfStock'; // named error the state machine can catch specifically
         throw e;
@@ -73,6 +78,7 @@ module.exports.handler = async ({ orderId }) => {
   }
 
   await updateOrderStatus(orderId, 'INVENTORY_RESERVED');
-
+  logger.info('Inventory reserved', { orderId });
+  
   return { orderId };
 };
