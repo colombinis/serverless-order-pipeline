@@ -2,9 +2,9 @@
 
 ![CI/CD](https://github.com/colombinis/serverless-order-pipeline/actions/workflows/ci.yml/badge.svg)
 
-Pipeline de fulfillment de órdenes en AWS, pensado como proyecto de práctica
-para cubrir los "Preferred Skills" de una entrevista orientada a OMS de e-commerce +
-AWS serverless (Lambda, Step Functions, DynamoDB, SQS/SNS).
+Pipeline de fulfillment de órdenes en AWS: un OMS de e-commerce serverless de punta
+a punta (API Gateway, Lambda, Step Functions, DynamoDB, SQS/SNS), desarrollable
+100% en local con Docker + MiniStack y desplegable a AWS real.
 
 > **Nota sobre el stack local**: el desarrollo local NO usa Serverless Framework.
 > Se usa **Docker Compose + MiniStack** (emulador de AWS, incluye API Gateway real)
@@ -39,7 +39,7 @@ Cliente HTTP
                                                                                                                                                  [SNS: OrderNotificationsTopic]
 ```
 
-## Por qué esta arquitectura (para hablar en la entrevista)
+## Por qué esta arquitectura
 
 - **API Gateway + Lambda desacoplado de SQS**: el cliente HTTP no espera a que
   termine todo el flujo de fulfillment (que puede tardar segundos). `createOrder`
@@ -450,9 +450,9 @@ Para detenerte en el arranque (antes del primer `await`), usá la config con
 > debugear cada handler en aislamiento con `local-invoke.js` y validar el
 > encadenamiento con el smoke test del bootstrap + logs.
 
-## Mapeo contra los requisitos de la entrevista
+## Qué cubre este proyecto
 
-| Requisito de la JD | Dónde está en este proyecto |
+| Capacidad | Dónde está en este proyecto |
 |---|---|
 | AWS Lambda | Las 9 funciones en `src/handlers/` |
 | SQS | `OrderQueue`, consumida por `processOrder` |

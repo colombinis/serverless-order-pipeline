@@ -98,7 +98,7 @@ return response(201, { orderId, status: order.status });   // 3) devuelve su ide
 
 <h2>Consejo de precisión: el <code>Location</code> que falta</h2>
 
-<p>Una nota fina, para que tu 201 sea de libro (y aparezca en entrevistas): la RFC pide que un 201 <strong>identifique el recurso creado</strong> — idealmente con un header <code>Location: /orders/{orderId}</code>. Hoy el <code>orderId</code> va en el cuerpo, que también sirve, pero el <code>Location</code> es el sello canónico. Es una mejora de una línea en <code>src/lib/response.js</code>.</p>
+<p>Una nota fina, para que tu 201 sea de libro: la RFC pide que un 201 <strong>identifique el recurso creado</strong> — idealmente con un header <code>Location: /orders/{orderId}</code>. Hoy el <code>orderId</code> va en el cuerpo, que también sirve, pero el <code>Location</code> es el sello canónico. Es una mejora de una línea en <code>src/lib/response.js</code>.</p>
 
 <h2>Quiz: Comprueba tu entendimiento</h2>
 

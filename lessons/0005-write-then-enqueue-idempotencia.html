@@ -98,7 +98,7 @@ name: `order-${orderId}-${Date.now()}`
 // Fix de UNA línea (la deja trabajar):
 name: `order-${orderId}`</code></pre>
 
-<p>Con el nombre fijo, el SQS redelivery de <code>order-abc</code> recibe <em>la misma ejecución</em> — el duplicado se absorbe gratis y de forma atómica, sin consultar la tabla. Ese es el tipo de detalle que separa una respuesta de entrevista buena de una excelente.</p>
+<p>Con el nombre fijo, el SQS redelivery de <code>order-abc</code> recibe <em>la misma ejecución</em> — el duplicado se absorbe gratis y de forma atómica, sin consultar la tabla. Ese es el tipo de detalle que separa una implementación correcta de una excelente.</p>
 
 <div class="callout callout-warning">
   <p class="callout-label">Los límites de la idempotencia de SFN</p>

@@ -92,7 +92,7 @@ functions:
           functionResponseType: ReportBatchItemFailures
 
   # 3-7. Individual steps of the state machine (each one is its own Lambda,
-  # which is the pattern most commonly evaluated in interviews: single-purpose functions)
+  # following the single-purpose-function pattern)
   validateStock:
     handler: src/handlers/validateStock.handler
 
